@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from dataclasses import dataclass, field
+from typing import Literal
 
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
@@ -43,6 +44,31 @@ class SmolVLAConfig(PreTrainedConfig):
     # Shorter state and action vectors will be padded
     max_state_dim: int = 32
     max_action_dim: int = 32
+    tactile_state_dim: int = 468
+    max_tactile_dim: int | None = None
+
+    tactile_input_type: Literal["none", "state", "image"] = "state"
+    tactile_feature_key: str = "observation.tactile"
+    tactile_image_feature_keys: tuple[str, ...] = ()
+    tactile_image_resize_with_padding: tuple[int, int] | None = (512, 512)
+    tactile_image_connector_hidden_dim: int = 4096
+    tactile_image_connector_out_dim: int = 4096
+    merge_tactile_into_language_tokens: bool = True
+    add_tactile_special_tokens: bool = True
+    tactile_start_special_token: str = "<TACTILE_START>"
+    tactile_end_special_token: str = "<TACTILE_END>"
+    enable_next_tactile_loss: bool = True
+    next_tactile_target_key: str = "next_observation.tactile"
+    next_tactile_target_dim: int = 468
+    next_tactile_loss_weight: float = 0.1
+    next_tactile_predict_from: Literal["last_suffix_token", "mean_suffix_tokens"] = "last_suffix_token"
+    enable_next_tactile_image_loss: bool = True
+    next_tactile_image_feature_keys: tuple[str, ...] = ()
+    next_tactile_image_loss_weight: float = 0.1
+    next_tactile_image_predict_from: Literal["last_suffix_token", "mean_suffix_tokens"] = "last_suffix_token"
+    tactile_lowpass_window: int = 5
+    use_tactile_low_freq: bool = True
+    use_tactile_high_freq: bool = True
 
     # Image preprocessing
     resize_imgs_with_padding: tuple[int, int] = (512, 512)
@@ -108,6 +134,8 @@ class SmolVLAConfig(PreTrainedConfig):
 
     compile_model: bool = False  # Whether to use torch.compile for model optimization
     compile_mode: str = "max-autotune"  # Torch compile mode
+    debug_tactile_pipeline_prints: bool = False
+    debug_print_every_n_steps: int = 100
 
     def __post_init__(self):
         super().__post_init__()
@@ -122,6 +150,72 @@ class SmolVLAConfig(PreTrainedConfig):
             raise NotImplementedError(
                 "`use_delta_joint_actions_aloha` is used by smolvla for aloha real models. It is not ported yet in LeRobot."
             )
+        if self.tactile_lowpass_window < 1:
+            raise ValueError(
+                f"`tactile_lowpass_window` must be >= 1. Got {self.tactile_lowpass_window}."
+            )
+        if self.tactile_input_type not in {"none", "state", "image"}:
+            raise ValueError(
+                f"`tactile_input_type` must be one of ['none', 'state', 'image']. Got {self.tactile_input_type}."
+            )
+        if self.tactile_input_type == "image" and len(self.tactile_image_feature_keys) == 0:
+            raise ValueError(
+                "`tactile_image_feature_keys` must be provided when `tactile_input_type='image'`."
+            )
+        if self.tactile_state_dim < 1:
+            raise ValueError(f"`tactile_state_dim` must be >= 1. Got {self.tactile_state_dim}.")
+        if self.tactile_image_connector_hidden_dim < 1:
+            raise ValueError(
+                f"`tactile_image_connector_hidden_dim` must be >= 1. Got {self.tactile_image_connector_hidden_dim}."
+            )
+        if self.tactile_image_connector_out_dim < 1:
+            raise ValueError(
+                f"`tactile_image_connector_out_dim` must be >= 1. Got {self.tactile_image_connector_out_dim}."
+            )
+        if self.add_tactile_special_tokens:
+            if not self.tactile_start_special_token:
+                raise ValueError("`tactile_start_special_token` must be a non-empty string.")
+            if not self.tactile_end_special_token:
+                raise ValueError("`tactile_end_special_token` must be a non-empty string.")
+        if self.next_tactile_target_dim < 1:
+            raise ValueError(f"`next_tactile_target_dim` must be >= 1. Got {self.next_tactile_target_dim}.")
+        if self.next_tactile_loss_weight < 0:
+            raise ValueError(f"`next_tactile_loss_weight` must be >= 0. Got {self.next_tactile_loss_weight}.")
+        if self.next_tactile_predict_from not in {"last_suffix_token", "mean_suffix_tokens"}:
+            raise ValueError(
+                "`next_tactile_predict_from` must be one of ['last_suffix_token', 'mean_suffix_tokens']. "
+                f"Got {self.next_tactile_predict_from}."
+            )
+        if self.next_tactile_image_loss_weight < 0:
+            raise ValueError(
+                f"`next_tactile_image_loss_weight` must be >= 0. Got {self.next_tactile_image_loss_weight}."
+            )
+        if self.next_tactile_image_predict_from not in {"last_suffix_token", "mean_suffix_tokens"}:
+            raise ValueError(
+                "`next_tactile_image_predict_from` must be one of ['last_suffix_token', 'mean_suffix_tokens']. "
+                f"Got {self.next_tactile_image_predict_from}."
+            )
+        if self.debug_print_every_n_steps < 1:
+            raise ValueError(
+                f"`debug_print_every_n_steps` must be >= 1. Got {self.debug_print_every_n_steps}."
+            )
+
+        if self.max_tactile_dim is None:
+            if self.tactile_input_type == "state":
+                enabled_components = int(self.use_tactile_low_freq) + int(self.use_tactile_high_freq)
+                if enabled_components == 0:
+                    raise ValueError(
+                        "When `tactile_input_type='state'`, at least one of `use_tactile_low_freq` or "
+                        "`use_tactile_high_freq` must be True."
+                    )
+                self.max_tactile_dim = self.tactile_state_dim * enabled_components
+            else:
+                # `tactile_proj` is instantiated regardless of modality, so keep a minimal safe size
+                # when tactile state inputs are not used.
+                self.max_tactile_dim = 1
+
+        if self.max_tactile_dim < 1:
+            raise ValueError(f"`max_tactile_dim` must be >= 1. Got {self.max_tactile_dim}.")
 
     def validate_features(self) -> None:
         for i in range(self.empty_cameras):

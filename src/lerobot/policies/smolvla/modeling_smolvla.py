@@ -1348,7 +1348,7 @@ class VLAFlowMatching(nn.Module):
         #    next_tactile_loss = F.mse_loss(next_tactile_pred, next_tactile_target, reduction="none").mean(dim=-1)
         next_tactile_loss = None
         next_tactile_image_loss = None
-        if self.config.enable_next_tactile_image_loss and next_tactile_images is not None and next_tactile_img_masks is not None:
+        if next_tactile_images is not None and next_tactile_img_masks is not None:
             if self.config.next_tactile_image_predict_from == "mean_suffix_tokens":
                 tactile_image_context = suffix_out.mean(dim=1)
             else:

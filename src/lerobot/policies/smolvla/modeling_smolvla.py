@@ -52,6 +52,7 @@ policy = SmolVLAPolicy.from_pretrained("lerobot/smolvla_base")
 
 """
 
+import logging
 import math
 from collections import deque
 from typing import TypedDict
@@ -67,6 +68,7 @@ from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
 from lerobot.policies.smolvla.smolvlm_with_expert import SmolVLMWithExpertModel
 from lerobot.policies.smolvla.tactile_frequency import split_tactile_low_high
 from lerobot.policies.utils import (
+    log_model_loading_keys,
     populate_queues,
 )
 from lerobot.utils.constants import ACTION, OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS, OBS_STATE
@@ -270,6 +272,37 @@ class SmolVLAPolicy(PreTrainedPolicy):
             if model_value is not None:
                 model_value.rtc_processor = self.rtc_processor
 
+    @classmethod
+    def _load_as_safetensor(cls, model, model_file: str, map_location: str, strict: bool):
+        """Override to handle vocab size expansion from added special tokens."""
+        from safetensors.torch import load_file as load_safetensor_file
+
+        state_dict = load_safetensor_file(model_file, device=map_location)
+        model_state_dict = model.state_dict()
+
+        adjusted_state_dict = {}
+        for key, ckpt_param in state_dict.items():
+            if key in model_state_dict:
+                model_param = model_state_dict[key]
+                if ckpt_param.shape != model_param.shape:
+                    logging.warning(
+                        f"Size mismatch for '{key}': checkpoint {tuple(ckpt_param.shape)} vs "
+                        f"model {tuple(model_param.shape)}. "
+                        "Copying overlapping rows; extra rows keep random initialization."
+                    )
+                    new_param = model_param.clone()
+                    slices = tuple(slice(0, min(s, m)) for s, m in zip(ckpt_param.shape, model_param.shape))
+                    new_param[slices] = ckpt_param[slices].to(dtype=model_param.dtype)
+                    adjusted_state_dict[key] = new_param
+                else:
+                    adjusted_state_dict[key] = ckpt_param
+            else:
+                adjusted_state_dict[key] = ckpt_param
+
+        missing_keys, unexpected_keys = model.load_state_dict(adjusted_state_dict, strict=strict)
+        log_model_loading_keys(missing_keys, unexpected_keys)
+        return model
+
     def get_optim_params(self) -> dict:
         return self.parameters()
 
@@ -291,7 +324,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
         lang_masks = batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
 
         actions = self.model.sample_actions(
-            images, img_masks, lang_tokens, lang_masks, state, tactile=None, noise=noise, **kwargs
+            images, img_masks, lang_tokens, lang_masks, state, tactile_state=None, tactile_images=None, tactile_img_masks=None, noise=noise, **kwargs
         )
 
         # Unpad actions
@@ -358,11 +391,6 @@ class SmolVLAPolicy(PreTrainedPolicy):
     def _use_tactile_for_vlm_training(self) -> bool:
         return self.training and not self.config.train_expert_only and self.config.tactile_input_type != "none"
 
-    def _should_debug_print(self) -> bool:
-        if not self.config.debug_tactile_pipeline_prints:
-            return False
-        return self._debug_forward_calls % self.config.debug_print_every_n_steps == 0
-
     def forward(
         self, batch: dict[str, Tensor], noise=None, time=None, reduction: str = "mean"
     ) -> dict[str, Tensor]:
@@ -376,58 +404,46 @@ class SmolVLAPolicy(PreTrainedPolicy):
                 - "mean": Return scalar mean loss (default, backward compatible)
                 - "none": Return per-sample losses of shape (batch_size,) for RA-BC weighting
         """
-        if self.config.adapt_to_pi_aloha:
-            batch[OBS_STATE] = self._pi_aloha_decode_state(batch[OBS_STATE])
-            batch[ACTION] = self._pi_aloha_encode_actions_inv(batch[ACTION])
-
-        self._debug_forward_calls += 1
-        should_debug_print = self._should_debug_print()
+        #if self.config.adapt_to_pi_aloha: # aloha 로봇을 사용하는 경우 state와 action을 변환합니다.
+        #    batch[OBS_STATE] = self._pi_aloha_decode_state(batch[OBS_STATE])
+        #    batch[ACTION] = self._pi_aloha_encode_actions_inv(batch[ACTION])    
 
         use_tactile_for_vlm = self._use_tactile_for_vlm_training()
         use_tactile_images = use_tactile_for_vlm and self.config.tactile_input_type == "image"
         use_tactile_state = use_tactile_for_vlm and self.config.tactile_input_type == "state"
+        print(f"[debug] use_tactile_for_vlm={use_tactile_for_vlm} use_tactile_images={use_tactile_images} use_tactile_state={use_tactile_state}")
+
+        tactile_state = None
+        next_tactile_target = None
+
+        tactile_images = None
+        tactile_img_masks = None
+        next_tactile_images = None
+        next_tactile_img_masks = None
 
         images, img_masks = self.prepare_images(batch)
-        tactile_images, tactile_img_masks = self.prepare_tactile_images(batch) if use_tactile_images else (None, None)
-        next_tactile_images, next_tactile_img_masks = (
-            self.prepare_next_tactile_images(batch) if use_tactile_images else (None, None)
-        )
         state = self.prepare_state(batch)
-        tactile = self.prepare_tactile(batch) if use_tactile_state else None
-        next_tactile_target = self.prepare_next_tactile_target(batch)
         lang_tokens = batch[f"{OBS_LANGUAGE_TOKENS}"]
         lang_masks = batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
         actions = self.prepare_action(batch)
         actions_is_pad = batch.get("actions_id_pad")
 
-        if should_debug_print:
-            print(
-                "[SmolVLA][debug] "
-                f"step={self._debug_forward_calls} "
-                f"mode={self.config.tactile_input_type} "
-                f"use_tactile_state={use_tactile_state} use_tactile_images={use_tactile_images}"
-            )
-            print(
-                "[SmolVLA][debug] "
-                f"images={len(images)} state={tuple(state.shape)} actions={tuple(actions.shape)} "
-                f"tactile_state={'None' if tactile is None else tuple(tactile.shape)}"
-            )
-            print(
-                "[SmolVLA][debug] "
-                f"tactile_images={0 if tactile_images is None else len(tactile_images)} "
-                f"next_tactile_target={'None' if next_tactile_target is None else tuple(next_tactile_target.shape)} "
-                f"next_tactile_images={0 if next_tactile_images is None else len(next_tactile_images)}"
-            )
+        if use_tactile_images:
+            tactile_images, tactile_img_masks = self.prepare_tactile_images(batch)
+            next_tactile_images, next_tactile_img_masks = self.prepare_next_tactile_images(batch)
+        elif use_tactile_state:
+            tactile_state = self.prepare_tactile(batch)
+            next_tactile_target = self.prepare_next_tactile_target(batch)
 
         loss_dict = {}
-        losses, next_tactile_loss, next_tactile_image_loss = self.model.forward(
-            images,
-            img_masks,
-            lang_tokens,
-            lang_masks,
-            state,
-            actions,
-            tactile,
+        losses, tactile_loss = self.model.forward(
+            images=images,
+            img_masks=img_masks,
+            lang_tokens=lang_tokens,
+            lang_masks=lang_masks,
+            state=state,
+            actions=actions,
+            tactile_state=tactile_state,
             tactile_images=tactile_images,
             tactile_img_masks=tactile_img_masks,
             next_tactile_target=next_tactile_target,
@@ -437,18 +453,8 @@ class SmolVLAPolicy(PreTrainedPolicy):
             time=time,
         )
         loss_dict["losses_after_forward"] = losses.clone().mean().item()
-        if next_tactile_loss is not None:
-            loss_dict["next_tactile_loss"] = next_tactile_loss.mean().item()
-        if next_tactile_image_loss is not None:
-            loss_dict["next_tactile_image_loss"] = next_tactile_image_loss.mean().item()
-
-        if should_debug_print:
-            print(
-                "[SmolVLA][debug] "
-                f"action_loss_mean={losses.mean().item():.6f} "
-                f"next_tactile_loss={'None' if next_tactile_loss is None else f'{next_tactile_loss.mean().item():.6f}'} "
-                f"next_tactile_image_loss={'None' if next_tactile_image_loss is None else f'{next_tactile_image_loss.mean().item():.6f}'}"
-            )
+        if tactile_loss is not None:
+            loss_dict["tactile_loss"] = tactile_loss.mean().item()
 
         if actions_is_pad is not None:
             in_episode_bound = ~actions_is_pad
@@ -462,19 +468,15 @@ class SmolVLAPolicy(PreTrainedPolicy):
         if reduction == "none":
             # Return per-sample losses (B,) by averaging over time and action dims
             per_sample_loss = losses.mean(dim=(1, 2))
-            if next_tactile_loss is not None:
-                per_sample_loss = per_sample_loss + self.config.next_tactile_loss_weight * next_tactile_loss
-            if next_tactile_image_loss is not None:
-                per_sample_loss = per_sample_loss + self.config.next_tactile_image_loss_weight * next_tactile_image_loss
+            if tactile_loss is not None:
+                per_sample_loss = per_sample_loss + self.config.next_tactile_loss_weight * tactile_loss
             loss_dict["loss"] = per_sample_loss.mean().item()
             return per_sample_loss, loss_dict
         else:
             # Default: return scalar mean loss
             loss = losses.mean()
-            if next_tactile_loss is not None:
-                loss = loss + self.config.next_tactile_loss_weight * next_tactile_loss.mean()
-            if next_tactile_image_loss is not None:
-                loss = loss + self.config.next_tactile_image_loss_weight * next_tactile_image_loss.mean()
+            if tactile_loss is not None:
+                loss = loss + self.config.next_tactile_loss_weight * tactile_loss.mean()
             loss_dict["loss"] = loss.item()
             return loss, loss_dict
 
@@ -484,14 +486,9 @@ class SmolVLAPolicy(PreTrainedPolicy):
         """
         images = []
         img_masks = []
-        tactile_image_keys = set(self.config.tactile_image_feature_keys)
-        base_image_keys = [
-            key for key in self.config.image_features if key not in tactile_image_keys
-        ]
-
-        present_img_keys = [key for key in base_image_keys if key in batch]
-
-        missing_img_keys = [key for key in base_image_keys if key not in batch]
+        present_img_keys = [key for key in self.config.image_features if key in batch]
+        missing_img_keys = [key for key in self.config.image_features if key not in batch]
+        print(f"[debug] present_img_keys={present_img_keys} missing_img_keys={missing_img_keys}")
 
         if len(present_img_keys) == 0:
             raise ValueError(
@@ -528,23 +525,51 @@ class SmolVLAPolicy(PreTrainedPolicy):
 
     def prepare_tactile_images(self, batch):
         """Prepare tactile images with a path distinct from regular camera images."""
+        tactile_img_keys = [
+            key for key, value in batch.items()
+            if key.startswith("observation.tactiles.")
+            and not key.endswith("_is_pad")
+            and not key.endswith("_padding_mask")
+        ]
+        tactile_img_keys = sorted(tactile_img_keys)
+        
+        if len(tactile_img_keys) == 0:
+            print("[warning!] tactile_img_keys: no tactile keys found in batch")
+            return None, None
+
         tactile_images = []
         tactile_img_masks = []
 
-        for key in self.config.tactile_image_feature_keys:
-            if key not in batch:
+        for key in tactile_img_keys:
+            img = batch[key]
+
+            # [B, T, C, H, W] -> 마지막 current frame 사용
+            if img.ndim == 5:
+                img = img[:, -1, :, :, :]
+            elif img.ndim != 4:
+                print(f"[warning] skip non-image tactile key: {key}, shape={img.shape}")
                 continue
 
-            img = batch[key][:, -1, :, :, :] if batch[key].ndim == 5 else batch[key]
             if self.config.tactile_image_resize_with_padding is not None:
-                img = resize_with_pad(img, *self.config.tactile_image_resize_with_padding, pad_value=0)
+                img = resize_with_pad(
+                    img,
+                    *self.config.tactile_image_resize_with_padding,
+                    pad_value=0,
+                )
 
             img = img * 2.0 - 1.0
 
             bsize = img.shape[0]
             device = img.device
+
             if f"{key}_padding_mask" in batch:
                 mask = batch[f"{key}_padding_mask"].bool()
+                if mask.ndim > 1:
+                    mask = mask[:, -1]
+            elif f"{key}_is_pad" in batch:
+                mask = ~batch[f"{key}_is_pad"].bool()
+                if mask.ndim > 1:
+                    mask = mask[:, -1]
             else:
                 mask = torch.ones(bsize, dtype=torch.bool, device=device)
 
@@ -556,37 +581,56 @@ class SmolVLAPolicy(PreTrainedPolicy):
 
         return tactile_images, tactile_img_masks
 
-    def prepare_next_tactile_images(self, batch):
-        if not self.config.enable_next_tactile_image_loss:
-            return None, None
 
-        if len(self.config.next_tactile_image_feature_keys) > 0:
-            next_image_keys = self.config.next_tactile_image_feature_keys
-        else:
-            next_image_keys = tuple(
-                key.replace("observation.", "next_observation.", 1)
-                if key.startswith("observation.")
-                else f"next_{key}"
-                for key in self.config.tactile_image_feature_keys
-            )
+    def prepare_next_tactile_images(self, batch):
+
+        tactile_img_keys = [
+            key for key, value in batch.items()
+            if key.startswith("observation.tactiles.")
+            and not key.endswith("_is_pad")
+            and not key.endswith("_padding_mask")
+            and torch.is_tensor(value)
+            and value.ndim in (4, 5)
+        ]
+        tactile_img_keys = sorted(tactile_img_keys)
+
+        if len(tactile_img_keys) == 0:
+            print("[warning] tactile_img_keys: no valid tactile image keys found in batch")
+            return None, None
 
         next_tactile_images = []
         next_tactile_img_masks = []
 
-        for key in next_image_keys:
-            if key not in batch:
+        for key in tactile_img_keys:
+            img = batch[key]
+
+            # [B, T, C, H, W] -> 마지막 current frame 사용
+            if img.ndim == 5:
+                img = img[:, -1, :, :, :]
+            elif img.ndim != 4:
+                print(f"[warning] skip non-image tactile key: {key}, shape={img.shape}")
                 continue
 
-            img = batch[key][:, -1, :, :, :] if batch[key].ndim == 5 else batch[key]
             if self.config.tactile_image_resize_with_padding is not None:
-                img = resize_with_pad(img, *self.config.tactile_image_resize_with_padding, pad_value=0)
+                img = resize_with_pad(
+                    img,
+                    *self.config.tactile_image_resize_with_padding,
+                    pad_value=0,
+                )
 
             img = img * 2.0 - 1.0
 
             bsize = img.shape[0]
             device = img.device
+
             if f"{key}_padding_mask" in batch:
                 mask = batch[f"{key}_padding_mask"].bool()
+                if mask.ndim > 1:
+                    mask = mask[:, -1]
+            elif f"{key}_is_pad" in batch:
+                mask = ~batch[f"{key}_is_pad"].bool()
+                if mask.ndim > 1:
+                    mask = mask[:, -1]
             else:
                 mask = torch.ones(bsize, dtype=torch.bool, device=device)
 
@@ -597,6 +641,30 @@ class SmolVLAPolicy(PreTrainedPolicy):
             return None, None
 
         return next_tactile_images, next_tactile_img_masks
+
+    def _resolve_next_tactile_image_keys(self, batch: dict[str, Tensor]) -> list[str]:
+        """Resolve next tactile image keys by deriving from current tactile keys.
+        We don't use next_tactile_image_feature_keys config — instead derive from
+        the current observation keys (observation.tactiles.* → next_observation.tactiles.*).
+        If explicit next keys are absent, return [] so prepare_next_tactile_images
+        falls back to the temporal index=1 path.
+        """
+
+        tactile_img_keys = [
+            key
+            for key, value in batch.items()
+            if key.startswith("observation.tactiles.") and isinstance(value, torch.Tensor) and value.ndim >= 4
+        ]
+        tactile_img_keys = sorted(tactile_img_keys)
+
+        derived_next_keys = [
+            key.replace("observation.", "next_observation.", 1)
+            for key in tactile_img_keys
+            if key.startswith("observation.") and
+               key.replace("observation.", "next_observation.", 1) in batch
+        ]
+
+        return derived_next_keys
 
     def _pi_aloha_decode_state(self, state):
         # Flip the joints.
@@ -642,8 +710,24 @@ class SmolVLAPolicy(PreTrainedPolicy):
         if self.config.tactile_input_type != "state":
             return None
 
-        tactile_key = self.config.tactile_feature_key
-        if tactile_key not in batch:
+        # Look for tactile state keys with the pattern "observation.tactiles.*"
+        # and exclude mask/bool tensors (e.g. "*_padding_mask").
+        tactile_key = None
+        for key, value in batch.items():
+            if not key.startswith("observation.tactiles."):
+                continue
+            if key.endswith("_padding_mask"):
+                continue
+            if not isinstance(value, torch.Tensor):
+                continue
+            if value.dtype == torch.bool:
+                continue
+            if value.ndim < 2 or value.ndim > 3:
+                continue
+            tactile_key = key
+            break
+        
+        if tactile_key is None:
             return None
 
         tactile = batch[tactile_key]
@@ -651,11 +735,24 @@ class SmolVLAPolicy(PreTrainedPolicy):
             tactile, lowpass_window=self.config.tactile_lowpass_window
         )
 
+        has_explicit_next_tactile = any(
+            key.startswith("next_observation.tactiles.") for key in batch.keys()
+        )
+        use_temporal_next_target = self.config.enable_next_tactile_loss and not has_explicit_next_tactile
+        select_idx = 0 if use_temporal_next_target else -1
+
+        if self._should_debug_print():
+            print(
+                "[SmolVLA][debug][TACTILE] "
+                f"prepare_tactile(state): key={tactile_key} raw_shape={tuple(tactile.shape)} "
+                f"has_explicit_next={has_explicit_next_tactile} select_idx={select_idx}"
+            )
+
         tactile_parts = []
         if self.config.use_tactile_low_freq:
-            tactile_parts.append(tactile_low[:, -1, :] if tactile_low.ndim > 2 else tactile_low)
+            tactile_parts.append(tactile_low[:, select_idx, :] if tactile_low.ndim > 2 else tactile_low)
         if self.config.use_tactile_high_freq:
-            tactile_parts.append(tactile_high[:, -1, :] if tactile_high.ndim > 2 else tactile_high)
+            tactile_parts.append(tactile_high[:, select_idx, :] if tactile_high.ndim > 2 else tactile_high)
 
         if not tactile_parts:
             return None
@@ -680,11 +777,17 @@ class SmolVLAPolicy(PreTrainedPolicy):
         if not self.config.enable_next_tactile_loss:
             return None
 
-        target_key = self.config.next_tactile_target_key
-        if target_key not in batch:
-            return None
+        tactile_img_keys = [
+            key
+            for key, value in batch.items()
+            if key.startswith("observation.tactiles.") and isinstance(value, torch.Tensor) and value.ndim >= 4
+        ]
+        tactile_img_keys = sorted(tactile_img_keys)
 
-        tactile_target = batch[target_key]
+        tactile_source = batch[tactile_img_keys]
+        if tactile_source.ndim <= 2 or tactile_source.shape[1] < 2:
+            return None
+        tactile_target = tactile_source[:, 1, :]
 
         if tactile_target.ndim > 2:
             tactile_target = tactile_target[:, -1, :]
@@ -796,8 +899,9 @@ class VLAFlowMatching(nn.Module):
         )
         tactile_connector_hidden_dim = self.config.tactile_image_connector_hidden_dim
         tactile_connector_out_dim = self.config.tactile_image_connector_out_dim
+        tactile_connector_in_dim = self.vlm_with_expert.config.text_config.hidden_size
         self.tactile_image_connector = nn.Sequential(
-            nn.LazyLinear(tactile_connector_hidden_dim),
+            nn.Linear(tactile_connector_in_dim, tactile_connector_hidden_dim),
             nn.GELU(),
             nn.Linear(tactile_connector_hidden_dim, tactile_connector_out_dim),
         )
@@ -935,7 +1039,7 @@ class VLAFlowMatching(nn.Module):
         lang_tokens,
         lang_masks,
         state: torch.Tensor = None,
-        tactile: torch.Tensor | None = None,
+        tactile_state: torch.Tensor | None = None,
         tactile_images=None,
         tactile_img_masks=None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -1004,8 +1108,8 @@ class VLAFlowMatching(nn.Module):
         bsize = lang_emb.shape[0]
         device = lang_emb.device
 
-        if tactile is not None:
-            tactile_emb = self.tactile_proj(tactile)
+        if tactile_state is not None:
+            tactile_emb = self.tactile_proj(tactile_state)
             tactile_emb = tactile_emb[:, None, :] if tactile_emb.ndim == 2 else tactile_emb
 
             tactile_seq_len = tactile_emb.shape[1]
@@ -1183,7 +1287,7 @@ class VLAFlowMatching(nn.Module):
         lang_masks,
         state,
         actions,
-        tactile=None,
+        tactile_state=None,
         tactile_images=None,
         tactile_img_masks=None,
         next_tactile_target=None,
@@ -1208,7 +1312,7 @@ class VLAFlowMatching(nn.Module):
             lang_tokens,
             lang_masks,
             state=state,
-            tactile=tactile,
+            tactile_state=tactile_state,
             tactile_images=tactile_images,
             tactile_img_masks=tactile_img_masks,
         )
@@ -1233,16 +1337,16 @@ class VLAFlowMatching(nn.Module):
         v_t = self.action_out_proj(suffix_out)
         losses = F.mse_loss(u_t, v_t, reduction="none")
 
+        #next_tactile_loss = None
+        #if self.config.enable_next_tactile_loss and next_tactile_target is not None:
+        #    if self.config.next_tactile_predict_from == "mean_suffix_tokens":
+        #        tactile_context = suffix_out.mean(dim=1)
+        #    else:
+        #        tactile_context = suffix_out[:, -1, :]
+        #
+        #    next_tactile_pred = self.next_tactile_head(tactile_context)
+        #    next_tactile_loss = F.mse_loss(next_tactile_pred, next_tactile_target, reduction="none").mean(dim=-1)
         next_tactile_loss = None
-        if self.config.enable_next_tactile_loss and next_tactile_target is not None:
-            if self.config.next_tactile_predict_from == "mean_suffix_tokens":
-                tactile_context = suffix_out.mean(dim=1)
-            else:
-                tactile_context = suffix_out[:, -1, :]
-
-            next_tactile_pred = self.next_tactile_head(tactile_context)
-            next_tactile_loss = F.mse_loss(next_tactile_pred, next_tactile_target, reduction="none").mean(dim=-1)
-
         next_tactile_image_loss = None
         if self.config.enable_next_tactile_image_loss and next_tactile_images is not None and next_tactile_img_masks is not None:
             if self.config.next_tactile_image_predict_from == "mean_suffix_tokens":
@@ -1273,7 +1377,9 @@ class VLAFlowMatching(nn.Module):
         lang_tokens,
         lang_masks,
         state,
-        tactile=None,
+        tactile_state=None,
+        tactile_images=None,
+        tactile_img_masks=None,
         noise=None,
         **kwargs: Unpack[ActionSelectKwargs],
     ) -> Tensor:
@@ -1286,7 +1392,7 @@ class VLAFlowMatching(nn.Module):
             noise = self.sample_noise(actions_shape, device)
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks, state=state, tactile=tactile
+            images, img_masks, lang_tokens, lang_masks, state=state, tactile_state=tactile_state, tactile_images=tactile_images, tactile_img_masks=tactile_img_masks
         )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1

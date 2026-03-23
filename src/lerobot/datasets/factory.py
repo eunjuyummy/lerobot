@@ -54,13 +54,29 @@ def resolve_delta_timestamps(
             returns `None` if the resulting dict is empty.
     """
     delta_timestamps = {}
+    is_smolvla = getattr(cfg, "type", None) == "smolvla"
+    needs_next_tactile = bool(
+        getattr(cfg, "enable_next_tactile_loss", False)
+        or getattr(cfg, "enable_next_tactile_image_loss", False)
+    )
+
     for key in ds_meta.features:
         if key == REWARD and cfg.reward_delta_indices is not None:
             delta_timestamps[key] = [i / ds_meta.fps for i in cfg.reward_delta_indices]
         if key == ACTION and cfg.action_delta_indices is not None:
             delta_timestamps[key] = [i / ds_meta.fps for i in cfg.action_delta_indices]
         if key.startswith(OBS_PREFIX) and cfg.observation_delta_indices is not None:
-            delta_timestamps[key] = [i / ds_meta.fps for i in cfg.observation_delta_indices]
+            obs_indices = list(cfg.observation_delta_indices)
+
+            if is_smolvla and needs_next_tactile and key.startswith("observation.tactiles."):
+                tactile_indices = list(obs_indices)
+                if 0 not in tactile_indices:
+                    tactile_indices.insert(0, 0)
+                if 1 not in tactile_indices:
+                    tactile_indices.append(1)
+                delta_timestamps[key] = [i / ds_meta.fps for i in tactile_indices]
+            else:
+                delta_timestamps[key] = [i / ds_meta.fps for i in obs_indices]
 
     if len(delta_timestamps) == 0:
         delta_timestamps = None

@@ -13,8 +13,6 @@
 # limitations under the License.
 
 from dataclasses import dataclass, field
-from typing import Literal
-
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
 from lerobot.optim.optimizers import AdamWConfig
@@ -22,7 +20,7 @@ from lerobot.optim.schedulers import (
     CosineDecayWithWarmupSchedulerConfig,
 )
 from lerobot.policies.rtc.configuration_rtc import RTCConfig
-from lerobot.utils.constants import OBS_IMAGES
+from lerobot.utils.constants import OBS_IMAGES, OBS_TACTILES
 
 
 @PreTrainedConfig.register_subclass("smolvla")
@@ -47,28 +45,26 @@ class SmolVLAConfig(PreTrainedConfig):
     tactile_state_dim: int = 468
     max_tactile_dim: int | None = None
 
-    tactile_input_type: Literal["none", "state", "image"] = "state"
-    tactile_feature_key: str = "observation.tactile"
-    tactile_image_feature_keys: tuple[str, ...] = ()
+    tactile_input_type: str = "image" # 텍타일 입력 방식을 지정합니다.
     tactile_image_resize_with_padding: tuple[int, int] | None = (512, 512)
     tactile_image_connector_hidden_dim: int = 4096
     tactile_image_connector_out_dim: int = 4096
-    merge_tactile_into_language_tokens: bool = True
-    add_tactile_special_tokens: bool = True
+    merge_tactile_into_language_tokens: bool = True # 텍타일 이미지를 언어 토큰에 병합합니다.
+    add_tactile_special_tokens: bool = True # 텍타일 정보를 감싸는 스페셜 토큰을 추가합니다.
     tactile_start_special_token: str = "<TACTILE_START>"
     tactile_end_special_token: str = "<TACTILE_END>"
-    enable_next_tactile_loss: bool = True
-    next_tactile_target_key: str = "next_observation.tactile"
+    # 텍타일 데이터가 신호인 경우 사용합니다.
+    enable_next_tactile_loss: bool = True 
     next_tactile_target_dim: int = 468
     next_tactile_loss_weight: float = 0.1
-    next_tactile_predict_from: Literal["last_suffix_token", "mean_suffix_tokens"] = "last_suffix_token"
-    enable_next_tactile_image_loss: bool = True
-    next_tactile_image_feature_keys: tuple[str, ...] = ()
-    next_tactile_image_loss_weight: float = 0.1
-    next_tactile_image_predict_from: Literal["last_suffix_token", "mean_suffix_tokens"] = "last_suffix_token"
+    next_tactile_predict_from: str = "last_suffix_token"
+    #enable_next_tactile_image_loss: bool = True
+    #next_tactile_image_loss_weight: float = 0.1
+    #next_tactile_image_predict_from: str = "last_suffix_token"
+    # 텍타일 데이터가 이미지인 경우 사용합니다.
     tactile_lowpass_window: int = 5
-    use_tactile_low_freq: bool = True
-    use_tactile_high_freq: bool = True
+    use_tactile_low_freq: bool = True # 저주파 텍타일 신호 사용 여부입니다. 일반적으로 로봇의 전반적인 상태를 나타냅니다.
+    use_tactile_high_freq: bool = True # 고주파 텍타일 신호 사용 여부입니다. 일반적으로 접촉과 같은 빠르게 변화하는 정보를 나타냅니다.
 
     # Image preprocessing
     resize_imgs_with_padding: tuple[int, int] = (512, 512)
@@ -158,10 +154,6 @@ class SmolVLAConfig(PreTrainedConfig):
             raise ValueError(
                 f"`tactile_input_type` must be one of ['none', 'state', 'image']. Got {self.tactile_input_type}."
             )
-        if self.tactile_input_type == "image" and len(self.tactile_image_feature_keys) == 0:
-            raise ValueError(
-                "`tactile_image_feature_keys` must be provided when `tactile_input_type='image'`."
-            )
         if self.tactile_state_dim < 1:
             raise ValueError(f"`tactile_state_dim` must be >= 1. Got {self.tactile_state_dim}.")
         if self.tactile_image_connector_hidden_dim < 1:
@@ -185,15 +177,6 @@ class SmolVLAConfig(PreTrainedConfig):
             raise ValueError(
                 "`next_tactile_predict_from` must be one of ['last_suffix_token', 'mean_suffix_tokens']. "
                 f"Got {self.next_tactile_predict_from}."
-            )
-        if self.next_tactile_image_loss_weight < 0:
-            raise ValueError(
-                f"`next_tactile_image_loss_weight` must be >= 0. Got {self.next_tactile_image_loss_weight}."
-            )
-        if self.next_tactile_image_predict_from not in {"last_suffix_token", "mean_suffix_tokens"}:
-            raise ValueError(
-                "`next_tactile_image_predict_from` must be one of ['last_suffix_token', 'mean_suffix_tokens']. "
-                f"Got {self.next_tactile_image_predict_from}."
             )
         if self.debug_print_every_n_steps < 1:
             raise ValueError(

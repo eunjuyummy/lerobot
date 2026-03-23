@@ -1191,8 +1191,8 @@ class VLAFlowMatching(nn.Module):
         # Set attention masks so that image and language inputs do not attend to state or actions
         att_masks += [1] * (states_seq_len) # 상태 토큰들을 1로 설정합니다.
 
-        if tactile is not None and not self.config.merge_tactile_into_language_tokens:
-            tactile_emb = self.tactile_proj(tactile)
+        if tactile_state is not None and not self.config.merge_tactile_into_language_tokens:
+            tactile_emb = self.tactile_proj(tactile_state)
             tactile_emb = tactile_emb[:, None, :] if tactile_emb.ndim == 2 else tactile_emb
             embs.append(tactile_emb)
 

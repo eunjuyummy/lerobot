@@ -738,7 +738,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
         has_explicit_next_tactile = any(
             key.startswith("next_observation.tactiles.") for key in batch.keys()
         )
-        use_temporal_next_target = self.config.enable_next_tactile_loss and not has_explicit_next_tactile
+        use_temporal_next_target = not has_explicit_next_tactile
         select_idx = 0 if use_temporal_next_target else -1
 
         if self._should_debug_print():
@@ -774,8 +774,6 @@ class SmolVLAPolicy(PreTrainedPolicy):
         return actions
 
     def prepare_next_tactile_target(self, batch):
-        if not self.config.enable_next_tactile_loss:
-            return None
 
         tactile_img_keys = [
             key
@@ -849,6 +847,51 @@ def pad_tensor(tensor, max_len, pad_value=0):
     return padded_tensor
 
 
+class SmallTactileConvEncoder(nn.Module):
+    """
+    Tiny CNN encoder for tactile images.
+    Outputs a single token per image: (B, 1, out_dim).
+
+    This avoids SmolVLM connector pixel_shuffle constraints (e.g., failing on 16x16).
+    """
+
+    def __init__(self, out_dim: int):
+        super().__init__()
+        self.out_dim = int(out_dim)
+
+        self.net = nn.Sequential(
+            nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.GELU(),
+
+            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.GELU(),
+
+            nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(256),
+            nn.GELU(),
+
+            nn.Conv2d(256, self.out_dim, kernel_size=1, stride=1, padding=0, bias=True),
+            nn.GELU(),
+        )
+        self.pool = nn.AdaptiveAvgPool2d((1, 1))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 4:
+            raise ValueError(f"Expected tactile image tensor (B,C,H,W), got {tuple(x.shape)}")
+
+        b, c, _, _ = x.shape
+        if c == 1:
+            x = x.repeat(1, 3, 1, 1)
+        elif c != 3:
+            raise ValueError(f"Expected C=1 or C=3 for tactile images, got C={c}")
+
+        feats = self.net(x)  # (B, D, h, w)
+        pooled = self.pool(feats).view(b, self.out_dim)  # (B, D)
+        return pooled.unsqueeze(1)  # (B, 1, D)
+    
+
 class VLAFlowMatching(nn.Module):
     """
     SmolVLA
@@ -897,8 +940,14 @@ class VLAFlowMatching(nn.Module):
         self.tactile_proj = nn.Linear(
             self.config.max_tactile_dim, self.vlm_with_expert.config.text_config.hidden_size
         )
+        
+        self.tactile_image_encoder = SmallTactileConvEncoder(
+            out_dim=self.vlm_with_expert.config.text_config.hidden_size
+        )
+             
         tactile_connector_hidden_dim = self.config.tactile_image_connector_hidden_dim
         tactile_connector_out_dim = self.config.tactile_image_connector_out_dim
+        
         tactile_connector_in_dim = self.vlm_with_expert.config.text_config.hidden_size
         self.tactile_image_connector = nn.Sequential(
             nn.Linear(tactile_connector_in_dim, tactile_connector_hidden_dim),
@@ -985,6 +1034,22 @@ class VLAFlowMatching(nn.Module):
         for params in self.next_tactile_image_head.parameters():
             params.requires_grad = self.config.train_state_proj
 
+    def _embed_tactile_image_tokens(self, tactile_img: torch.Tensor) -> torch.Tensor:
+        """
+        Tactile image -> tokens (B, T, text_hidden)
+        Uses small CNN to avoid SmolVLM pixel_shuffle.
+        """
+        enc_param = next(self.tactile_image_encoder.parameters())
+        tactile_img_emb = self.tactile_image_encoder(tactile_img.to(dtype=enc_param.dtype))
+
+        tactile_img_emb = self.tactile_image_connector(tactile_img_emb)
+        tactile_img_emb = self.tactile_image_connector_out_proj(tactile_img_emb)
+
+        # Normalize embeddings (same style as existing code)
+        d = tactile_img_emb.shape[-1]
+        tactile_img_emb = tactile_img_emb * torch.tensor(d**0.5, dtype=tactile_img_emb.dtype, device=tactile_img_emb.device)
+        return tactile_img_emb
+
     def _encode_tactile_image_target_latent(self, tactile_images, tactile_img_masks):
         if tactile_images is None or tactile_img_masks is None:
             return None
@@ -992,17 +1057,7 @@ class VLAFlowMatching(nn.Module):
         image_latents = []
         image_masks = []
         for tactile_img, tactile_img_mask in zip(tactile_images, tactile_img_masks, strict=False):
-            tactile_img_emb = self.vlm_with_expert.embed_image(tactile_img)
-            tactile_img_emb = self.tactile_image_connector(tactile_img_emb)
-            tactile_img_emb = self.tactile_image_connector_out_proj(tactile_img_emb)
-
-            tactile_img_emb_dim = tactile_img_emb.shape[-1]
-            tactile_img_emb = tactile_img_emb * torch.tensor(
-                tactile_img_emb_dim**0.5,
-                dtype=tactile_img_emb.dtype,
-                device=tactile_img_emb.device,
-            )
-
+            tactile_img_emb = self._embed_tactile_image_tokens(tactile_img)
             pooled_image_latent = tactile_img_emb.mean(dim=1)
             image_latents.append(pooled_image_latent)
             image_masks.append(tactile_img_mask.bool())
@@ -1121,16 +1176,7 @@ class VLAFlowMatching(nn.Module):
 
         if tactile_images is not None and tactile_img_masks is not None:
             for tactile_img, tactile_img_mask in zip(tactile_images, tactile_img_masks, strict=False):
-                tactile_img_emb = self.vlm_with_expert.embed_image(tactile_img)
-                tactile_img_emb = self.tactile_image_connector(tactile_img_emb)
-                tactile_img_emb = self.tactile_image_connector_out_proj(tactile_img_emb)
-
-                tactile_img_emb_dim = tactile_img_emb.shape[-1]
-                tactile_img_emb = tactile_img_emb * torch.tensor(
-                    tactile_img_emb_dim**0.5,
-                    dtype=tactile_img_emb.dtype,
-                    device=tactile_img_emb.device,
-                )
+                tactile_img_emb = self._embed_tactile_image_tokens(tactile_img)
 
                 _, num_tactile_img_embs = tactile_img_emb.shape[:2]
                 tactile_img_mask = tactile_img_mask[:, None].expand(bsize, num_tactile_img_embs)
@@ -1202,17 +1248,7 @@ class VLAFlowMatching(nn.Module):
             att_masks += [1] * tactile_seq_len
 
         if tactile_images is not None and tactile_img_masks is not None and not self.config.merge_tactile_into_language_tokens:
-            for tactile_img, tactile_img_mask in zip(tactile_images, tactile_img_masks, strict=False):
-                tactile_img_emb = self.vlm_with_expert.embed_image(tactile_img)
-                tactile_img_emb = self.tactile_image_connector(tactile_img_emb)
-                tactile_img_emb = self.tactile_image_connector_out_proj(tactile_img_emb)
-
-                tactile_img_emb_dim = tactile_img_emb.shape[-1]
-                tactile_img_emb = tactile_img_emb * torch.tensor(
-                    tactile_img_emb_dim**0.5,
-                    dtype=tactile_img_emb.dtype,
-                    device=tactile_img_emb.device,
-                )
+                tactile_img_emb = self._embed_tactile_image_tokens(tactile_img)
 
                 _, num_tactile_img_embs = tactile_img_emb.shape[:2]
                 tactile_img_mask = tactile_img_mask[:, None].expand(bsize, num_tactile_img_embs)
@@ -1337,15 +1373,6 @@ class VLAFlowMatching(nn.Module):
         v_t = self.action_out_proj(suffix_out)
         losses = F.mse_loss(u_t, v_t, reduction="none")
 
-        #next_tactile_loss = None
-        #if self.config.enable_next_tactile_loss and next_tactile_target is not None:
-        #    if self.config.next_tactile_predict_from == "mean_suffix_tokens":
-        #        tactile_context = suffix_out.mean(dim=1)
-        #    else:
-        #        tactile_context = suffix_out[:, -1, :]
-        #
-        #    next_tactile_pred = self.next_tactile_head(tactile_context)
-        #    next_tactile_loss = F.mse_loss(next_tactile_pred, next_tactile_target, reduction="none").mean(dim=-1)
         next_tactile_loss = None
         next_tactile_image_loss = None
 

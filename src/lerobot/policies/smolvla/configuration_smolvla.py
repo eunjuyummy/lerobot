@@ -46,21 +46,17 @@ class SmolVLAConfig(PreTrainedConfig):
     max_tactile_dim: int | None = None
 
     tactile_input_type: str = "image" # 텍타일 입력 방식을 지정합니다.
-    tactile_image_resize_with_padding: tuple[int, int] | None = (512, 512)
-    tactile_image_connector_hidden_dim: int = 4096
-    tactile_image_connector_out_dim: int = 4096
+    tactile_image_resize_with_padding: tuple[int, int] | None = (16, 16)
+    tactile_image_connector_hidden_dim: int = 1024
+    tactile_image_connector_out_dim: int = 1024
     merge_tactile_into_language_tokens: bool = True # 텍타일 이미지를 언어 토큰에 병합합니다.
     add_tactile_special_tokens: bool = True # 텍타일 정보를 감싸는 스페셜 토큰을 추가합니다.
     tactile_start_special_token: str = "<TACTILE_START>"
     tactile_end_special_token: str = "<TACTILE_END>"
-    # 텍타일 데이터가 신호인 경우 사용합니다.
-    enable_next_tactile_loss: bool = True 
+    # 텍타일 정보를 활용하기 위한 config입니다.
     next_tactile_target_dim: int = 468
     next_tactile_loss_weight: float = 0.1
     next_tactile_predict_from: str = "last_suffix_token"
-    #enable_next_tactile_image_loss: bool = True
-    #next_tactile_image_loss_weight: float = 0.1
-    #next_tactile_image_predict_from: str = "last_suffix_token"
     # 텍타일 데이터가 이미지인 경우 사용합니다.
     tactile_lowpass_window: int = 5
     use_tactile_low_freq: bool = True # 저주파 텍타일 신호 사용 여부입니다. 일반적으로 로봇의 전반적인 상태를 나타냅니다.

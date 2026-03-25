@@ -68,7 +68,7 @@ from lerobot.policies.smolvla.smolvlm_with_expert import SmolVLMWithExpertModel
 from lerobot.policies.utils import (
     populate_queues,
 )
-from lerobot.utils.constants import ACTION, OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS, OBS_STATE
+from lerobot.utils.constants import ACTION, OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS, OBS_STATE, OBS_TACTILES
 from lerobot.utils.utils import get_safe_dtype
 
 
@@ -470,8 +470,26 @@ class SmolVLAPolicy(PreTrainedPolicy):
         return actions
 
     def prepare_state(self, batch):
-        """Pad state"""
+        """Pad state.
+
+        Optionally concatenates tactile state (e.g. `observation.tactiles.state`) to the base
+        `observation.state` before padding.
+        """
         state = batch[OBS_STATE][:, -1, :] if batch[OBS_STATE].ndim > 2 else batch[OBS_STATE]
+
+        if getattr(self.config, "merge_tactile_state_into_robot_state", False):
+            tactile_key = f"{OBS_TACTILES}.state"
+            if tactile_key in batch:
+                tactile_state = batch[tactile_key]
+                tactile_state = tactile_state[:, -1, :] if tactile_state.ndim > 2 else tactile_state
+                tactile_state = tactile_state.to(device=state.device, dtype=state.dtype)
+                state = torch.cat([state, tactile_state], dim=-1)
+
+        if state.shape[-1] > self.config.max_state_dim:
+            raise ValueError(
+                f"Merged state dim ({state.shape[-1]}) exceeds max_state_dim ({self.config.max_state_dim}). "
+                "Increase `policy.max_state_dim` or disable tactile-state fusion."
+            )
         state = pad_vector(state, self.config.max_state_dim)
         return state
 

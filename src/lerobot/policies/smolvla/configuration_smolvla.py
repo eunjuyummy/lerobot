@@ -21,7 +21,7 @@ from lerobot.optim.schedulers import (
     CosineDecayWithWarmupSchedulerConfig,
 )
 from lerobot.policies.rtc.configuration_rtc import RTCConfig
-from lerobot.utils.constants import OBS_IMAGES
+from lerobot.utils.constants import OBS_IMAGES, OBS_STATE, OBS_TACTILES
 
 
 @PreTrainedConfig.register_subclass("smolvla")
@@ -43,6 +43,11 @@ class SmolVLAConfig(PreTrainedConfig):
     # Shorter state and action vectors will be padded
     max_state_dim: int = 32
     max_action_dim: int = 32
+
+    # Optional tactile state fusion.
+    # If the dataset provides `observation.tactiles.state`, it will be concatenated to
+    # `observation.state` inside the policy/model.
+    merge_tactile_state_into_robot_state: bool = True
 
     # Image preprocessing
     resize_imgs_with_padding: tuple[int, int] = (512, 512)
@@ -124,6 +129,9 @@ class SmolVLAConfig(PreTrainedConfig):
             )
 
     def validate_features(self) -> None:
+        if self.input_features is None:
+            self.input_features = {}
+
         for i in range(self.empty_cameras):
             key = f"{OBS_IMAGES}.empty_camera_{i}"
             empty_camera = PolicyFeature(
@@ -131,6 +139,18 @@ class SmolVLAConfig(PreTrainedConfig):
                 shape=(3, 480, 640),
             )
             self.input_features[key] = empty_camera
+
+        tactile_state_key = f"{OBS_TACTILES}.state"
+        if (
+            self.merge_tactile_state_into_robot_state
+            and OBS_STATE in self.input_features
+            and tactile_state_key in self.input_features
+        ):
+            robot_state_dim = int(self.input_features[OBS_STATE].shape[-1])
+            tactile_state_dim = int(self.input_features[tactile_state_key].shape[-1])
+            required_dim = robot_state_dim + tactile_state_dim
+            if self.max_state_dim < required_dim:
+                self.max_state_dim = required_dim
 
     def get_optimizer_preset(self) -> AdamWConfig:
         return AdamWConfig(

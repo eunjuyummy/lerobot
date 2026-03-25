@@ -44,6 +44,17 @@ class SmolVLAConfig(PreTrainedConfig):
     max_state_dim: int = 32
     max_action_dim: int = 32
 
+    # Tactile (optional)
+    # - "none": ignore tactile observations
+    # - "image": treat tactile observations as additional images under `observation.tactiles.*`
+    #   (they are concatenated to the image list and go through the main vision backbone).
+    # - "encoder": encode tactile images with a small CNN and append the resulting embedding tokens
+    #   to the prefix sequence (avoids upsampling tactile to the main vision input resolution).
+    tactile_input_type: str = "none"
+
+    # Used when `tactile_input_type="encoder"`.
+    tactile_encoder_width: int = 64
+
     # Image preprocessing
     resize_imgs_with_padding: tuple[int, int] = (512, 512)
 
@@ -121,6 +132,11 @@ class SmolVLAConfig(PreTrainedConfig):
         if self.use_delta_joint_actions_aloha:
             raise NotImplementedError(
                 "`use_delta_joint_actions_aloha` is used by smolvla for aloha real models. It is not ported yet in LeRobot."
+            )
+
+        if self.tactile_input_type not in {"none", "image"}:
+            raise ValueError(
+                f"`tactile_input_type` must be one of ['none', 'image', 'encoder']. Got {self.tactile_input_type}."
             )
 
     def validate_features(self) -> None:

@@ -65,10 +65,11 @@ from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.rtc.modeling_rtc import RTCProcessor
 from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
 from lerobot.policies.smolvla.smolvlm_with_expert import SmolVLMWithExpertModel
+from lerobot.policies.smolvla.tactile_image_encoder import SmallTactileImageEncoder
 from lerobot.policies.utils import (
     populate_queues,
 )
-from lerobot.utils.constants import ACTION, OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS, OBS_STATE
+from lerobot.utils.constants import ACTION, OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS, OBS_STATE, OBS_TACTILES
 from lerobot.utils.utils import get_safe_dtype
 
 
@@ -284,12 +285,21 @@ class SmolVLAPolicy(PreTrainedPolicy):
                 batch[k] = torch.stack(list(self._queues[k]), dim=1)
 
         images, img_masks = self.prepare_images(batch)
+        tactile_images, tactile_masks = self.prepare_tactiles(batch)
         state = self.prepare_state(batch)
         lang_tokens = batch[f"{OBS_LANGUAGE_TOKENS}"]
         lang_masks = batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
 
         actions = self.model.sample_actions(
-            images, img_masks, lang_tokens, lang_masks, state, noise=noise, **kwargs
+            images,
+            img_masks,
+            lang_tokens,
+            lang_masks,
+            state,
+            tactile_images=tactile_images,
+            tactile_masks=tactile_masks,
+            noise=noise,
+            **kwargs,
         )
 
         # Unpad actions
@@ -371,13 +381,25 @@ class SmolVLAPolicy(PreTrainedPolicy):
             batch[ACTION] = self._pi_aloha_encode_actions_inv(batch[ACTION])
 
         images, img_masks = self.prepare_images(batch)
+        tactile_images, tactile_masks = self.prepare_tactiles(batch)
         state = self.prepare_state(batch)
         lang_tokens = batch[f"{OBS_LANGUAGE_TOKENS}"]
         lang_masks = batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
         actions = self.prepare_action(batch)
         actions_is_pad = batch.get("actions_id_pad")
         loss_dict = {}
-        losses = self.model.forward(images, img_masks, lang_tokens, lang_masks, state, actions, noise, time)
+        losses = self.model.forward(
+            images,
+            img_masks,
+            lang_tokens,
+            lang_masks,
+            state,
+            actions,
+            tactile_images=tactile_images,
+            tactile_masks=tactile_masks,
+            noise=noise,
+            time=time,
+        )
         loss_dict["losses_after_forward"] = losses.clone().mean().item()
 
         if actions_is_pad is not None:
@@ -409,10 +431,16 @@ class SmolVLAPolicy(PreTrainedPolicy):
         present_img_keys = [key for key in self.config.image_features if key in batch]
         missing_img_keys = [key for key in self.config.image_features if key not in batch]
 
+        # Optionally treat tactile observations as extra images.
+        if getattr(self.config, "tactile_input_type", None) == "image":
+            tactile_keys = sorted([k for k in batch.keys() if k.startswith(f"{OBS_TACTILES}.")])
+            for k in tactile_keys:
+                if k not in present_img_keys:
+                    present_img_keys.append(k)
+
+        # Allow image-less batches as long as the model can still run.
         if len(present_img_keys) == 0:
-            raise ValueError(
-                f"All image features are missing from the batch. At least one expected. (batch: {batch.keys()}) (image_features:{self.config.image_features})"
-            )
+            return [], []
         # Preprocess image features present in the batch
         for key in present_img_keys:
             img = batch[key][:, -1, :, :, :] if batch[key].ndim == 5 else batch[key]
@@ -441,6 +469,45 @@ class SmolVLAPolicy(PreTrainedPolicy):
             images.append(img)
             img_masks.append(mask)
         return images, img_masks
+
+    def prepare_tactiles(self, batch: dict[str, Tensor]) -> tuple[list[Tensor] | None, list[Tensor] | None]:
+        """Prepare tactile images for the tactile encoder pathway.
+
+        Returns:
+            tactile_images: list of (B,C,H,W) tensors (or None if disabled)
+            tactile_masks:  list of (B,) bool masks (or None if disabled)
+        """
+        if getattr(self.config, "tactile_input_type", "none") != "encoder":
+            return None, None
+
+        tactile_keys = sorted([k for k in batch.keys() if k.startswith(f"{OBS_TACTILES}.")])
+        if len(tactile_keys) == 0:
+            return None, None
+
+        tactile_images: list[Tensor] = []
+        tactile_masks: list[Tensor] = []
+        for key in tactile_keys:
+            img = batch[key][:, -1, :, :, :] if batch[key].ndim == 5 else batch[key]
+
+            # Normalize to [0, 1] for the small tactile encoder.
+            if torch.is_floating_point(img):
+                if img.max() > 1.5:
+                    img = img / 255.0
+            else:
+                img = img.to(dtype=torch.float32) / 255.0
+            img = img.clamp(0.0, 1.0)
+
+            bsize = img.shape[0]
+            device = img.device
+            if f"{key}_padding_mask" in batch:
+                mask = batch[f"{key}_padding_mask"].bool()
+            else:
+                mask = torch.ones(bsize, dtype=torch.bool, device=device)
+
+            tactile_images.append(img)
+            tactile_masks.append(mask)
+
+        return tactile_images, tactile_masks
 
     def _pi_aloha_decode_state(self, state):
         # Flip the joints.
@@ -581,6 +648,14 @@ class VLAFlowMatching(nn.Module):
             self.vlm_with_expert.expert_hidden_size, self.vlm_with_expert.expert_hidden_size
         )
 
+        self.tactile_encoder: SmallTactileImageEncoder | None = None
+        if getattr(self.config, "tactile_input_type", "none") == "encoder":
+            self.tactile_encoder = SmallTactileImageEncoder(
+                embed_dim=self.vlm_with_expert.config.text_config.hidden_size,
+                in_channels=3,
+                width=getattr(self.config, "tactile_encoder_width", 64),
+            )
+
         self.set_requires_grad()
         self.fake_image_token = self.vlm_with_expert.processor.tokenizer.fake_image_token_id
         self.global_image_token = self.vlm_with_expert.processor.tokenizer.global_image_token_id
@@ -623,7 +698,14 @@ class VLAFlowMatching(nn.Module):
         return time
 
     def embed_prefix(
-        self, images, img_masks, lang_tokens, lang_masks, state: torch.Tensor = None
+        self,
+        images,
+        img_masks,
+        lang_tokens,
+        lang_masks,
+        state: torch.Tensor = None,
+        tactile_images: list[torch.Tensor] | None = None,
+        tactile_masks: list[torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Embed images with SigLIP and language tokens with embedding layer to prepare
         for SmolVLM transformer processing.
@@ -678,6 +760,30 @@ class VLAFlowMatching(nn.Module):
                 embs.append(image_end_token)
                 pad_masks.append(image_end_mask)
                 att_masks += [0] * (image_end_mask.shape[1])
+
+        if tactile_images is not None and len(tactile_images) > 0:
+            if self.tactile_encoder is None:
+                raise ValueError(
+                    "Received tactile_images but tactile_encoder is not initialized. "
+                    "Set `tactile_input_type='encoder'` in config."
+                )
+            if tactile_masks is None:
+                tactile_masks = [None] * len(tactile_images)
+
+            for t_img, t_mask in zip(tactile_images, tactile_masks, strict=False):
+                t_emb = self.tactile_encoder(t_img)
+                t_emb = t_emb[:, None, :]
+                t_emb = t_emb * math.sqrt(t_emb.shape[-1])
+                embs.append(t_emb)
+
+                bsize = t_emb.shape[0]
+                device = t_emb.device
+                if t_mask is None:
+                    t_mask = torch.ones(bsize, dtype=torch.bool, device=device)
+                t_mask = t_mask[:, None]
+                pad_masks.append(t_mask)
+                att_masks += [0] * t_mask.shape[1]
+
         lang_emb = self.vlm_with_expert.embed_language_tokens(lang_tokens)
         # Normalize language embeddings
         lang_emb_dim = lang_emb.shape[-1]
@@ -760,7 +866,17 @@ class VLAFlowMatching(nn.Module):
         return embs, pad_masks, att_masks
 
     def forward(
-        self, images, img_masks, lang_tokens, lang_masks, state, actions, noise=None, time=None
+        self,
+        images,
+        img_masks,
+        lang_tokens,
+        lang_masks,
+        state,
+        actions,
+        tactile_images: list[torch.Tensor] | None = None,
+        tactile_masks: list[torch.Tensor] | None = None,
+        noise=None,
+        time=None,
     ) -> Tensor:
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
         if noise is None:
@@ -773,7 +889,13 @@ class VLAFlowMatching(nn.Module):
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks, state=state
+            images,
+            img_masks,
+            lang_tokens,
+            lang_masks,
+            state=state,
+            tactile_images=tactile_images,
+            tactile_masks=tactile_masks,
         )
         suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, time)
 
@@ -804,6 +926,8 @@ class VLAFlowMatching(nn.Module):
         lang_tokens,
         lang_masks,
         state,
+        tactile_images: list[torch.Tensor] | None = None,
+        tactile_masks: list[torch.Tensor] | None = None,
         noise=None,
         **kwargs: Unpack[ActionSelectKwargs],
     ) -> Tensor:
@@ -816,7 +940,13 @@ class VLAFlowMatching(nn.Module):
             noise = self.sample_noise(actions_shape, device)
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks, state=state
+            images,
+            img_masks,
+            lang_tokens,
+            lang_masks,
+            state=state,
+            tactile_images=tactile_images,
+            tactile_masks=tactile_masks,
         )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1

@@ -489,7 +489,8 @@ def make_policy(
         # Load a pretrained policy and override the config if needed (for example, if there are inference-time
         # hyperparameters that we want to vary).
         kwargs["pretrained_name_or_path"] = cfg.pretrained_path
-        policy = policy_cls.from_pretrained(**kwargs)
+        kwargs["config"] = cfg  # This is needed in case we want to override some config parameters at loading time.
+        policy = policy_cls.from_pretrained(config=cfg, **kwargs)
     elif cfg.pretrained_path and cfg.use_peft:
         # Load a pretrained PEFT model on top of the policy. The pretrained path points to the folder/repo
         # of the adapter and the adapter's config contains the path to the base policy. So we need the
@@ -519,6 +520,9 @@ def make_policy(
 
     policy.to(cfg.device)
     assert isinstance(policy, torch.nn.Module)
+
+    if hasattr(cfg, "tactile_input_type"):
+        logging.info(f"Policy override check: tactile_input_type={getattr(cfg, 'tactile_input_type')}")
 
     # policy = torch.compile(policy, mode="reduce-overhead")
 

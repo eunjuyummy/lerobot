@@ -258,6 +258,22 @@ class _NormalizationMixin:
                 # Convert to tensor but preserve original dtype for adaptation logic
                 tensor = torch.as_tensor(new_observation[key])
                 new_observation[key] = self._apply_transform(tensor, key, feature.type, inverse=inverse)
+
+        # SmolVLA (and some datasets) may provide tactile state features under dynamic keys like
+        # `observation.tactiles.*` without registering them in the policy's feature schema.
+        # If dataset stats are available for those keys, normalize them as STATE to avoid
+        # raw-scale values (e.g., 0..500) dominating auxiliary losses.
+        for key, value in list(new_observation.items()):
+            if key in self.features:
+                continue
+            if not isinstance(key, str) or not key.startswith("observation.tactiles."):
+                continue
+            if self.normalize_observation_keys is not None and key not in self.normalize_observation_keys:
+                continue
+            if key not in self._tensor_stats:
+                continue
+            tensor = torch.as_tensor(value)
+            new_observation[key] = self._apply_transform(tensor, key, FeatureType.STATE, inverse=inverse)
         return new_observation
 
     def _normalize_action(self, action: Tensor, inverse: bool) -> Tensor:

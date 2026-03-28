@@ -210,10 +210,33 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
         peft_model=None,
     ):
         api = HfApi()
-        repo_id = api.create_repo(
-            repo_id=self.config.repo_id, private=self.config.private, exist_ok=True
-        ).repo_id
+        
+        # `repo_id` can be provided via the training config CLI (cfg.policy.repo_id).
+        # When instantiating from a pretrained model, the policy's internal config may come from the Hub
+        # and miss CLI overrides unless we explicitly propagate them. Be defensive here.
+        policy_cfg = getattr(cfg, "policy", None)
+        repo_id = None
+        private = None
+        if policy_cfg is not None:
+            repo_id = getattr(policy_cfg, "repo_id", None)
+            private = getattr(policy_cfg, "private", None)
+        if not repo_id:
+            repo_id = getattr(self.config, "repo_id", None)
+        if private is None:
+            private = getattr(self.config, "private", None)
 
+        if not repo_id:
+            raise ValueError(
+                "'policy.repo_id' argument missing. Please specify it to push the model to the hub, e.g. "
+                "`--policy.repo_id=username/my-model` (or disable with `--policy.push_to_hub=false`)."
+            )
+
+        # Keep internal config in sync for downstream pushes (pre/post processors).
+        if getattr(self.config, "repo_id", None) != repo_id:
+            self.config.repo_id = repo_id
+
+        repo_id = api.create_repo(repo_id=repo_id, private=private, exist_ok=True).repo_id
+        
         # Push the files to the repo in a single commit
         with TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             saved_path = Path(tmp) / repo_id

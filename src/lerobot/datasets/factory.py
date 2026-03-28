@@ -55,9 +55,25 @@ def resolve_delta_timestamps(
     """
     delta_timestamps = {}
     is_smolvla = getattr(cfg, "type", None) == "smolvla"
+    # SmolVLA can optionally predict next-step tactile. In that case we must ensure
+    # the tactile observation is loaded with at least two temporal indices (0=current, 1=next)
+    # so the policy can form a next-step target even when the dataset doesn't provide
+    # explicit `next_observation.*` keys.
+    smolvla_next_tactile_enabled = bool(
+        is_smolvla
+        and getattr(cfg, "tactile_input_type", "none") == "state"
+        and float(getattr(cfg, "next_tactile_loss_weight", 0.0) or 0.0) > 0.0
+    )
+    smolvla_next_tactile_image_enabled = bool(
+        is_smolvla
+        and getattr(cfg, "tactile_input_type", "none") == "image"
+        and float(getattr(cfg, "next_tactile_image_loss_weight", 0.0) or 0.0) > 0.0
+    )
     needs_next_tactile = bool(
         getattr(cfg, "enable_next_tactile_loss", False)
         or getattr(cfg, "enable_next_tactile_image_loss", False)
+        or smolvla_next_tactile_enabled
+        or smolvla_next_tactile_image_enabled
     )
 
     for key in ds_meta.features:

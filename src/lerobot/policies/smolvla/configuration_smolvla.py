@@ -106,6 +106,20 @@ class SmolVLAConfig(PreTrainedConfig):
     # Real-Time Chunking (RTC) configuration
     rtc_config: RTCConfig | None = None
 
+    # --- Tactile encoder (optional) ---
+    # If set, tactile visual features (typically `observation.tactiles.*`) will be embedded with the
+    # specified tactile encoder instead of the VLM vision encoder.
+    tactile_encoder_type: str | None = None  # e.g. "sparsh_dino_small"
+    tactile_encoder_checkpoint_dir: str | None = None  # e.g. "/workspace/sparsh/checkpoints/sparsh-dino-small"
+    tactile_key_prefix: str = "observation.tactiles."  # keys starting with this prefix are treated as tactile
+    freeze_tactile_encoder: bool = True
+
+    # SPARSH-specific settings
+    sparsh_repo_path: str | None = None  # e.g. "/workspace/sparsh" (used to import `tactile_ssl`)
+    sparsh_image_size: int = 224
+    sparsh_temporal_stride: int = 5  # uses I_t and I_{t-stride} to form 6-channel input; falls back to I_t duplicated
+    sparsh_pool: str = "mean"  # "mean" (default) pools patch tokens into one tactile token
+
     compile_model: bool = False  # Whether to use torch.compile for model optimization
     compile_mode: str = "max-autotune"  # Torch compile mode
 

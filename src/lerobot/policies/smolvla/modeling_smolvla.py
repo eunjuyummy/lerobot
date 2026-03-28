@@ -283,13 +283,13 @@ class SmolVLAPolicy(PreTrainedPolicy):
             if k in self._queues and k != ACTION:
                 batch[k] = torch.stack(list(self._queues[k]), dim=1)
 
-        images, img_masks = self.prepare_images(batch)
+        images, img_masks, img_keys = self.prepare_images(batch)
         state = self.prepare_state(batch)
         lang_tokens = batch[f"{OBS_LANGUAGE_TOKENS}"]
         lang_masks = batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
 
         actions = self.model.sample_actions(
-            images, img_masks, lang_tokens, lang_masks, state, noise=noise, **kwargs
+            images, img_masks, lang_tokens, lang_masks, state, noise=noise, img_keys=img_keys, **kwargs
         )
 
         # Unpad actions
@@ -370,16 +370,16 @@ class SmolVLAPolicy(PreTrainedPolicy):
             batch[OBS_STATE] = self._pi_aloha_decode_state(batch[OBS_STATE])
             batch[ACTION] = self._pi_aloha_encode_actions_inv(batch[ACTION])
 
-        images, img_masks = self.prepare_images(batch)
+        images, img_masks, img_keys = self.prepare_images(batch)
         state = self.prepare_state(batch)
         lang_tokens = batch[f"{OBS_LANGUAGE_TOKENS}"]
         lang_masks = batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
         actions = self.prepare_action(batch)
         actions_is_pad = batch.get("actions_id_pad")
         loss_dict = {}
-        losses = self.model.forward(images, img_masks, lang_tokens, lang_masks, state, actions, noise, time)
+        losses = self.model.forward(images, img_masks, lang_tokens, lang_masks, state, actions, noise, time, img_keys=img_keys)
         loss_dict["losses_after_forward"] = losses.clone().mean().item()
-
+        
         if actions_is_pad is not None:
             in_episode_bound = ~actions_is_pad
             losses = losses * in_episode_bound.unsqueeze(-1)
@@ -404,8 +404,15 @@ class SmolVLAPolicy(PreTrainedPolicy):
         """Apply SmolVLA preprocessing to the images, like resizing to 224x224 and padding to keep aspect ratio, and
         convert pixel range from [0.0, 1.0] to [-1.0, 1.0] as requested by SigLIP.
         """
-        images = []
-        img_masks = []
+        images: list[Tensor] = []
+        img_masks: list[Tensor] = []
+        img_keys: list[str] = []
+
+        def is_tactile_key(key: str) -> bool:
+            if self.config.tactile_encoder_type is None:
+                return False
+            return key.startswith(self.config.tactile_key_prefix)
+
         present_img_keys = [key for key in self.config.image_features if key in batch]
         missing_img_keys = [key for key in self.config.image_features if key not in batch]
 
@@ -413,14 +420,22 @@ class SmolVLAPolicy(PreTrainedPolicy):
             raise ValueError(
                 f"All image features are missing from the batch. At least one expected. (batch: {batch.keys()}) (image_features:{self.config.image_features})"
             )
+        base_img_for_empty: Tensor | None = None
+        base_mask_for_empty: Tensor | None = None
+
         # Preprocess image features present in the batch
         for key in present_img_keys:
-            img = batch[key][:, -1, :, :, :] if batch[key].ndim == 5 else batch[key]
-            if self.config.resize_imgs_with_padding is not None:
-                img = resize_with_pad(img, *self.config.resize_imgs_with_padding, pad_value=0)
+            if is_tactile_key(key):
+                # Keep tactile tensors as-is (may be 4D or 5D). The tactile encoder will build
+                # a temporal pair and perform its own resizing.
+                img = batch[key]
+            else:
+                img = batch[key][:, -1, :, :, :] if batch[key].ndim == 5 else batch[key]
+                if self.config.resize_imgs_with_padding is not None:
+                    img = resize_with_pad(img, *self.config.resize_imgs_with_padding, pad_value=0)
 
-            # Normalize from range [0,1] to [-1,1] as expacted by siglip
-            img = img * 2.0 - 1.0
+                # Normalize from range [0,1] to [-1,1] as expacted by siglip
+                img = img * 2.0 - 1.0
 
             bsize = img.shape[0]
             device = img.device
@@ -428,20 +443,30 @@ class SmolVLAPolicy(PreTrainedPolicy):
                 mask = batch[f"{key}_padding_mask"].bool()
             else:
                 mask = torch.ones(bsize, dtype=torch.bool, device=device)
+
+            if not is_tactile_key(key):
+                base_img_for_empty = img
+                base_mask_for_empty = mask
+
             images.append(img)
             img_masks.append(mask)
+            img_keys.append(key)
 
         # Create image features not present in the batch
         # as fully 0 padded images.
-        for num_empty_cameras in range(len(missing_img_keys)):
-            if num_empty_cameras >= self.config.empty_cameras:
-                break
-            img = torch.ones_like(img) * -1
-            mask = torch.zeros_like(mask)
-            images.append(img)
-            img_masks.append(mask)
-        return images, img_masks
+        missing_camera_keys = [k for k in missing_img_keys if not is_tactile_key(k)]
+        if base_img_for_empty is not None and base_mask_for_empty is not None:
+            for num_empty_cameras in range(len(missing_camera_keys)):
+                if num_empty_cameras >= self.config.empty_cameras:
+                    break
+                empty_img = torch.ones_like(base_img_for_empty) * -1
+                empty_mask = torch.zeros_like(base_mask_for_empty)
+                images.append(empty_img)
+                img_masks.append(empty_mask)
+                img_keys.append(missing_camera_keys[num_empty_cameras])
 
+        return images, img_masks, img_keys
+    
     def _pi_aloha_decode_state(self, state):
         # Flip the joints.
         for motor_idx in [1, 2, 8, 9]:
@@ -568,6 +593,34 @@ class VLAFlowMatching(nn.Module):
             expert_width_multiplier=self.config.expert_width_multiplier,
             device=self.config.device if self.config.device is not None else "auto",
         )
+
+        # Optional tactile encoder (e.g. SPARSH) that replaces the VLM vision encoder for tactile keys.
+        self.tactile_encoder: nn.Module | None = None
+        self.tactile_proj: nn.Linear | None = None
+        if self.config.tactile_encoder_type is not None:
+            tactile_type = self.config.tactile_encoder_type.lower()
+            if tactile_type in {"sparsh_dino_small", "sparsh-dino-small", "sparsh"}:
+                if not self.config.tactile_encoder_checkpoint_dir:
+                    raise ValueError(
+                        "`tactile_encoder_checkpoint_dir` must be set when using `tactile_encoder_type=sparsh_dino_small`."
+                    )
+                from lerobot.policies.smolvla.tactile_encoder_sparsh import SparshDinoSmallTactileEncoder
+
+                self.tactile_encoder = SparshDinoSmallTactileEncoder(
+                    checkpoint_dir=self.config.tactile_encoder_checkpoint_dir,
+                    sparsh_repo_path=self.config.sparsh_repo_path,
+                    image_size=self.config.sparsh_image_size,
+                )
+                self.tactile_proj = nn.Linear(
+                    self.tactile_encoder.embed_dim, self.vlm_with_expert.config.text_config.hidden_size
+                )
+
+                if self.config.freeze_tactile_encoder:
+                    self.tactile_encoder.eval()
+                    for p in self.tactile_encoder.parameters():
+                        p.requires_grad = False
+            else:
+                raise ValueError(f"Unknown `tactile_encoder_type`: {self.config.tactile_encoder_type}")
         self.state_proj = nn.Linear(
             self.config.max_state_dim, self.vlm_with_expert.config.text_config.hidden_size
         )
@@ -623,7 +676,14 @@ class VLAFlowMatching(nn.Module):
         return time
 
     def embed_prefix(
-        self, images, img_masks, lang_tokens, lang_masks, state: torch.Tensor = None
+        self,
+        images,
+        img_masks,
+        lang_tokens,
+        lang_masks,
+        *,
+        img_keys: list[str] | None = None,
+        state: torch.Tensor = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Embed images with SigLIP and language tokens with embedding layer to prepare
         for SmolVLM transformer processing.
@@ -631,10 +691,10 @@ class VLAFlowMatching(nn.Module):
         embs = []
         pad_masks = []
         att_masks = []
-        for _img_idx, (
-            img,
-            img_mask,
-        ) in enumerate(zip(images, img_masks, strict=False)):
+        if img_keys is None:
+            img_keys = [""] * len(images)
+
+        for _img_idx, (img, img_mask, img_key) in enumerate(zip(images, img_masks, img_keys, strict=False)):
             if self.add_image_special_tokens:
                 image_start_token = (
                     self.vlm_with_expert.embed_language_tokens(
@@ -650,8 +710,7 @@ class VLAFlowMatching(nn.Module):
                 embs.append(image_start_token)
                 pad_masks.append(image_start_mask)
 
-            img_emb = self.vlm_with_expert.embed_image(img)
-            img_emb = img_emb
+            img_emb = self._embed_visual(img_key, img)
 
             # Normalize image embeddings
             img_emb_dim = img_emb.shape[-1]
@@ -716,6 +775,94 @@ class VLAFlowMatching(nn.Module):
 
         return embs, pad_masks, att_masks
 
+    def _is_tactile_key(self, key: str) -> bool:
+        if self.tactile_encoder is None:
+            return False
+        return bool(key) and key.startswith(self.config.tactile_key_prefix)
+
+    def _embed_visual(self, key: str, x: Tensor) -> Tensor:
+        """Embed either a normal image (via VLM vision encoder) or a tactile observation (via tactile encoder)."""
+        if self._is_tactile_key(key):
+            return self._embed_tactile(x)
+
+        if x.ndim != 4:
+            raise ValueError(
+                f"Non-tactile visual feature '{key}' must be (B,C,H,W) after preprocessing, got {tuple(x.shape)}"
+            )
+        return self.vlm_with_expert.embed_image(x)
+
+    def _embed_tactile(self, x: Tensor) -> Tensor:
+        assert self.tactile_encoder is not None
+        assert self.tactile_proj is not None
+
+        def to_bchw(img: Tensor) -> Tensor:
+            # Accept (B,C,H,W) or (B,H,W,C)
+            if img.ndim != 4:
+                raise ValueError(f"Expected 4D image tensor, got {tuple(img.shape)}")
+            if img.shape[1] in (1, 3, 6):
+                out = img
+            elif img.shape[-1] in (1, 3, 6):
+                out = img.permute(0, 3, 1, 2).contiguous()
+            else:
+                # Fall back to assuming channel-first
+                out = img
+
+            if out.dtype == torch.uint8:
+                out = out.to(dtype=torch.float32) / 255.0
+            return out
+
+        def to_btchw(seq: Tensor) -> Tensor:
+            # Accept (B,T,C,H,W) or (B,T,H,W,C)
+            if seq.ndim != 5:
+                raise ValueError(f"Expected 5D tactile sequence tensor, got {tuple(seq.shape)}")
+            if seq.shape[2] in (1, 3, 6):
+                out = seq
+            elif seq.shape[-1] in (1, 3, 6):
+                out = seq.permute(0, 1, 4, 2, 3).contiguous()
+            else:
+                out = seq
+
+            if out.dtype == torch.uint8:
+                out = out.to(dtype=torch.float32) / 255.0
+            return out
+
+        # x can be (B,C,H,W), (B,H,W,C), (B,T,C,H,W) or (B,T,H,W,C)
+        if x.ndim == 5:
+            x_seq = to_btchw(x)
+            cur = x_seq[:, -1]
+            stride = int(self.config.sparsh_temporal_stride)
+            prev_idx = x_seq.shape[1] - 1 - stride
+            prev = x_seq[:, prev_idx] if prev_idx >= 0 else cur
+        elif x.ndim == 4:
+            cur = to_bchw(x)
+            prev = cur
+        else:
+            raise ValueError(f"Tactile tensor must be 4D or 5D, got {tuple(x.shape)}")
+
+        # If grayscale, replicate to RGB.
+        if cur.shape[1] == 1:
+            cur = cur.repeat(1, 3, 1, 1)
+        if prev.shape[1] == 1:
+            prev = prev.repeat(1, 3, 1, 1)
+
+        if cur.shape[1] != 3 or prev.shape[1] != 3:
+            raise ValueError(
+                f"SPARSH tactile encoder expects 3-channel frames. Got cur C={cur.shape[1]} prev C={prev.shape[1]}"
+            )
+
+        # SPARSH expects a 6-channel image: I_t || I_{t-stride}
+        tactile_pair = torch.cat([cur, prev], dim=1)
+        patch_tokens = self.tactile_encoder(tactile_pair)  # (B, N, 384)
+
+        pool = (self.config.sparsh_pool or "mean").lower()
+        if pool == "mean":
+            pooled = patch_tokens.mean(dim=1)
+        else:
+            raise ValueError(f"Unsupported SPARSH pooling mode: {self.config.sparsh_pool}")
+
+        token = self.tactile_proj(pooled).unsqueeze(1)  # (B, 1, hidden)
+        return token
+
     def embed_suffix(self, noisy_actions, timestep):
         """Embed state, noisy_actions, timestep to prepare for Expert Gemma processing."""
         embs = []
@@ -760,7 +907,17 @@ class VLAFlowMatching(nn.Module):
         return embs, pad_masks, att_masks
 
     def forward(
-        self, images, img_masks, lang_tokens, lang_masks, state, actions, noise=None, time=None
+        self,
+        images,
+        img_masks,
+        lang_tokens,
+        lang_masks,
+        state,
+        actions,
+        noise=None,
+        time=None,
+        *,
+        img_keys: list[str] | None = None,
     ) -> Tensor:
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
         if noise is None:
@@ -773,7 +930,7 @@ class VLAFlowMatching(nn.Module):
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks, state=state
+            images, img_masks, lang_tokens, lang_masks, img_keys=img_keys, state=state
         )
         suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, time)
 
@@ -805,6 +962,8 @@ class VLAFlowMatching(nn.Module):
         lang_masks,
         state,
         noise=None,
+        *,
+        img_keys: list[str] | None = None,
         **kwargs: Unpack[ActionSelectKwargs],
     ) -> Tensor:
         """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
@@ -816,7 +975,7 @@ class VLAFlowMatching(nn.Module):
             noise = self.sample_noise(actions_shape, device)
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks, state=state
+            images, img_masks, lang_tokens, lang_masks, img_keys=img_keys, state=state
         )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1

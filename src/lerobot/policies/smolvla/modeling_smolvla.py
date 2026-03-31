@@ -55,6 +55,7 @@ policy = SmolVLAPolicy.from_pretrained("lerobot/smolvla_base")
 import logging
 import math
 from collections import deque
+from contextlib import contextmanager, nullcontext
 from typing import TypedDict
 
 import torch
@@ -743,9 +744,13 @@ class SmolVLAPolicy(PreTrainedPolicy):
 
     def _get_default_peft_targets(self) -> dict[str, any]:
         """Return default PEFT target modules for SmolVLA fine-tuning."""
+        # PEFT LoRA can only inject into certain module *types* (e.g. nn.Linear).
+        # Do NOT target container modules like nn.Sequential or nn.Identity.
+        # For Sequentials, target their internal Linear layers explicitly.
         common_projections = (
-            "state_proj|tactile_proj|tactile_image_connector|tactile_image_connector_out_proj|"
-            "next_tactile_vlm_head|predicted_next_tactile_to_token|"
+            "state_proj|tactile_proj|"
+            "tactile_image_connector\\.0|tactile_image_connector\\.2|tactile_image_connector_out_proj|"
+            "next_tactile_vlm_head\\.1|next_tactile_vlm_head\\.3|predicted_next_tactile_to_token|"
             "action_in_proj|action_out_proj|action_time_mlp_in|action_time_mlp_out"
         )
         target_modules = rf"(model\.vlm_with_expert\.lm_expert\..*\.(q|v)_proj|model\.({common_projections}))"
@@ -1026,6 +1031,18 @@ class VLAFlowMatching(nn.Module):
             return
         self._last_tactile_vector_metrics = self._compute_tactile_vector_metrics(pred=pred, target=target)
 
+    @staticmethod
+    @contextmanager
+    def _temporarily_disable_requires_grad(module: nn.Module):
+        prev_flags = [p.requires_grad for p in module.parameters()]
+        try:
+            for p in module.parameters():
+                p.requires_grad_(False)
+            yield
+        finally:
+            for p, flag in zip(module.parameters(), prev_flags, strict=False):
+                p.requires_grad_(flag)
+
     def _predict_next_tactile_and_token_from_prefix(
         self,
         prefix_embs: torch.Tensor,
@@ -1040,16 +1057,24 @@ class VLAFlowMatching(nn.Module):
         """
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
-        (prefix_out, _), _ = self.vlm_with_expert.forward(
-            attention_mask=prefix_att_2d_masks,
-            position_ids=prefix_position_ids,
-            past_key_values=None,
-            inputs_embeds=[prefix_embs, None],
-            use_cache=False,
-            # Force the self-attention path even when attention_mode includes cross-attn.
-            # Cross-attn assumes expert stream exists, but here we run prefix-only.
-            fill_kv_cache=True,
+
+        freeze_vlm = bool(getattr(self.config, "freeze_vlm_for_tactile_loss", False))
+        freeze_ctx = (
+            self._temporarily_disable_requires_grad(self.vlm_with_expert)
+            if (self.training and freeze_vlm)
+            else nullcontext()
         )
+        with freeze_ctx:
+            (prefix_out, _), _ = self.vlm_with_expert.forward(
+                attention_mask=prefix_att_2d_masks,
+                position_ids=prefix_position_ids,
+                past_key_values=None,
+                inputs_embeds=[prefix_embs, None],
+                use_cache=False,
+                # Force the self-attention path even when attention_mode includes cross-attn.
+                # Cross-attn assumes expert stream exists, but here we run prefix-only.
+                fill_kv_cache=True,
+            )
 
         bsize = prefix_out.shape[0]
         device = prefix_out.device
@@ -1373,6 +1398,12 @@ class VLAFlowMatching(nn.Module):
             device = prefix_embs.device
             token_pad_mask = torch.ones(bsize, 1, dtype=torch.bool, device=device)
             token_att_mask = torch.ones(bsize, 1, dtype=torch.bool, device=device)
+
+            # Important: the predicted tactile token is used to condition the Action Expert.
+            # Detach here so action loss gradients do NOT backprop through this token path
+            # (e.g., into next tactile head / tactile encoders).
+            predicted_token_emb = predicted_token_emb.detach()
+
             prefix_embs = torch.cat([prefix_embs, predicted_token_emb], dim=1)
             prefix_pad_masks = torch.cat([prefix_pad_masks, token_pad_mask], dim=1)
             prefix_att_masks = torch.cat([prefix_att_masks, token_att_mask], dim=1)
@@ -1448,6 +1479,10 @@ class VLAFlowMatching(nn.Module):
             )
             token_pad_mask = torch.ones(bsize, 1, dtype=torch.bool, device=device)
             token_att_mask = torch.ones(bsize, 1, dtype=torch.bool, device=device)
+
+            # Inference is wrapped in no_grad in callers, but keep behavior consistent.
+            predicted_token_emb = predicted_token_emb.detach()
+
             prefix_embs = torch.cat([prefix_embs, predicted_token_emb], dim=1)
             prefix_pad_masks = torch.cat([prefix_pad_masks, token_pad_mask], dim=1)
             prefix_att_masks = torch.cat([prefix_att_masks, token_att_mask], dim=1)

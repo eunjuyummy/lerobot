@@ -490,7 +490,7 @@ def make_policy(
         # hyperparameters that we want to vary).
         kwargs["pretrained_name_or_path"] = cfg.pretrained_path
         kwargs["config"] = cfg  # This is needed in case we want to override some config parameters at loading time.
-        policy = policy_cls.from_pretrained(config=cfg, **kwargs)
+        policy = policy_cls.from_pretrained(**kwargs)
     elif cfg.pretrained_path and cfg.use_peft:
         # Load a pretrained PEFT model on top of the policy. The pretrained path points to the folder/repo
         # of the adapter and the adapter's config contains the path to the base policy. So we need the

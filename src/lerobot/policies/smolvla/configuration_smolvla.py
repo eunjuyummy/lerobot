@@ -51,6 +51,9 @@ class SmolVLAConfig(PreTrainedConfig):
     tactile_image_connector_out_dim: int = 1024
     next_tactile_target_dim: int = 468
     next_tactile_loss_weight: float = 0.1
+    # When True, the next-tactile loss does NOT update VLM/action parameters.
+    # Gradients still flow to tactile modules through the prefix embeddings.
+    freeze_vlm_for_tactile_loss: bool = True
     use_tactile_high_freq: bool = True # 고주파 텍타일 신호 사용 여부입니다. False로 설정하면 저주파 신호만 사용합니다.
 
     # Image preprocessing

@@ -16,8 +16,10 @@
 import concurrent.futures
 import contextlib
 import logging
+import os
 import shutil
 import tempfile
+import time
 from collections.abc import Callable
 from pathlib import Path
 
@@ -1080,17 +1082,65 @@ class LeRobotDataset(torch.utils.data.Dataset):
         return self.num_frames
 
     def __getitem__(self, idx) -> dict:
+        do_profile = os.environ.get("LEROBOT_PROFILE_DATASET", "0") not in {"", "0", "false", "False"}
+        profile_every_raw = os.environ.get("LEROBOT_PROFILE_DATASET_EVERY", "200")
+        try:
+            profile_every = int(profile_every_raw)
+        except ValueError:
+            profile_every = 200
+        if profile_every <= 0:
+            profile_every = 200
+
+        if do_profile and not hasattr(self, "_profile_stats"):
+            self._profile_stats = {
+                "count": 0,
+                "ensure_s": 0.0,
+                "hf_row_s": 0.0,
+                "delta_query_s": 0.0,
+                "video_query_s": 0.0,
+                "img_tfs_s": 0.0,
+                "task_map_s": 0.0,
+                "total_s": 0.0,
+            }
+
+        t_total0 = time.perf_counter() if do_profile else 0.0
+
         # Ensure dataset is loaded when we actually need to read from it
+        t0 = time.perf_counter() if do_profile else 0.0
         self._ensure_hf_dataset_loaded()
+        if do_profile:
+            self._profile_stats["ensure_s"] += time.perf_counter() - t0
+
+        t0 = time.perf_counter() if do_profile else 0.0
         item = self.hf_dataset[idx]
+        if do_profile:
+            self._profile_stats["hf_row_s"] += time.perf_counter() - t0
+
         ep_idx = item["episode_index"].item()
         # Use the absolute index from the dataset for delta timestamp calculations
         abs_idx = item["index"].item()
 
         query_indices = None
         if self.delta_indices is not None:
+            t0 = time.perf_counter() if do_profile else 0.0
             query_indices, padding = self._get_query_indices(abs_idx, ep_idx)
-            query_result = self._query_hf_dataset(query_indices)
+
+            # Optimization: if a key only requests the current index (e.g. observation_delta_indices=[0]),
+            # avoid a redundant HF re-query. Reuse the already-fetched base item and just add a time dim.
+            reduced_query_indices: dict[str, list[int]] = {}
+            for key, q_idx_abs in query_indices.items():
+                if key in self.meta.video_keys:
+                    continue
+                if len(q_idx_abs) == 1 and q_idx_abs[0] == abs_idx and key in item:
+                    val = item[key]
+                    if isinstance(val, torch.Tensor):
+                        item[key] = val.unsqueeze(0)
+                else:
+                    reduced_query_indices[key] = q_idx_abs
+
+            query_result = self._query_hf_dataset(reduced_query_indices) if len(reduced_query_indices) > 0 else {}
+            if do_profile:
+                self._profile_stats["delta_query_s"] += time.perf_counter() - t0
             item = {**item, **padding}
             for key, val in query_result.items():
                 item[key] = val
@@ -1098,15 +1148,22 @@ class LeRobotDataset(torch.utils.data.Dataset):
         if len(self.meta.video_keys) > 0:
             current_ts = item["timestamp"].item()
             query_timestamps = self._get_query_timestamps(current_ts, query_indices)
+            t0 = time.perf_counter() if do_profile else 0.0
             video_frames = self._query_videos(query_timestamps, ep_idx)
+            if do_profile:
+                self._profile_stats["video_query_s"] += time.perf_counter() - t0
             item = {**video_frames, **item}
 
         if self.image_transforms is not None:
+            t0 = time.perf_counter() if do_profile else 0.0
             image_keys = self.meta.camera_keys
             for cam in image_keys:
                 item[cam] = self.image_transforms(item[cam])
+            if do_profile:
+                self._profile_stats["img_tfs_s"] += time.perf_counter() - t0
 
         # Add task as a string
+        t0 = time.perf_counter() if do_profile else 0.0
         task_idx = item["task_index"].item()
         item["task"] = self.meta.tasks.iloc[task_idx].name
 
@@ -1114,6 +1171,43 @@ class LeRobotDataset(torch.utils.data.Dataset):
         if "subtask_index" in self.features and self.meta.subtasks is not None:
             subtask_idx = item["subtask_index"].item()
             item["subtask"] = self.meta.subtasks.iloc[subtask_idx].name
+
+        if do_profile:
+            self._profile_stats["task_map_s"] += time.perf_counter() - t0
+            dt_total = time.perf_counter() - t_total0
+            self._profile_stats["total_s"] += dt_total
+            self._profile_stats["count"] += 1
+
+            if self._profile_stats["count"] % profile_every == 0:
+                worker = torch.utils.data.get_worker_info()
+                worker_id = worker.id if worker is not None else 0
+                n = float(self._profile_stats["count"])
+                msg = (
+                    "DatasetProfile"
+                    f" pid={os.getpid()} worker={worker_id}"
+                    f" n={int(n)}"
+                    f" total={self._profile_stats['total_s']/n:.4f}s"
+                    f" ensure={self._profile_stats['ensure_s']/n:.4f}s"
+                    f" hf_row={self._profile_stats['hf_row_s']/n:.4f}s"
+                    f" delta={self._profile_stats['delta_query_s']/n:.4f}s"
+                    f" video={self._profile_stats['video_query_s']/n:.4f}s"
+                    f" img_tfs={self._profile_stats['img_tfs_s']/n:.4f}s"
+                    f" task_map={self._profile_stats['task_map_s']/n:.4f}s"
+                    f" video_backend={getattr(self, 'video_backend', None)}"
+                    f" vcodec={getattr(self, 'vcodec', None)}"
+                )
+                if getattr(self, "delta_indices", None) is not None:
+                    try:
+                        top = sorted(
+                            ((k, len(v)) for k, v in self.delta_indices.items()),
+                            key=lambda kv: kv[1],
+                            reverse=True,
+                        )[:5]
+                        top_str = ",".join([f"{k}:{l}" for k, l in top])
+                        msg += f" delta_top=[{top_str}]"
+                    except Exception:
+                        pass
+                logging.info(msg)
 
         return item
 

@@ -318,13 +318,36 @@ class SmolVLAPolicy(PreTrainedPolicy):
             if k in self._queues and k != ACTION:
                 batch[k] = torch.stack(list(self._queues[k]), dim=1)
 
+        # Note: tactile conditioning is supported in both training and inference.
+        # We explicitly prepare tactile inputs here so they can be consumed by the model.
+        use_tactile_images = self.config.tactile_input_type == "image"
+        use_tactile_state = self.config.tactile_input_type == "state"
+
+        tactile_images = None
+        tactile_img_masks = None
+        tactile_state = None
+
+        if use_tactile_images:
+            tactile_images, tactile_img_masks = self.prepare_tactile_images(batch)
+        elif use_tactile_state:
+            tactile_state = self.prepare_tactile(batch)
+
         images, img_masks = self.prepare_images(batch, include_tactile_images=False)
         state = self.prepare_state(batch)
         lang_tokens = batch[f"{OBS_LANGUAGE_TOKENS}"]
         lang_masks = batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
 
         actions = self.model.sample_actions(
-            images, img_masks, lang_tokens, lang_masks, state, tactile_state=None, tactile_images=None, tactile_img_masks=None, noise=noise, **kwargs
+            images,
+            img_masks,
+            lang_tokens,
+            lang_masks,
+            state,
+            tactile_state=tactile_state,
+            tactile_images=tactile_images,
+            tactile_img_masks=tactile_img_masks,
+            noise=noise,
+            **kwargs,
         )
 
         # Unpad actions
@@ -483,7 +506,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
             loss_dict["loss"] = loss.item()
             return loss, loss_dict
 
-    def prepare_images(self, batch):
+    def prepare_images(self, batch, include_tactile_images: bool = True):
         """Apply SmolVLA preprocessing to the images, like resizing to 224x224 and padding to keep aspect ratio, and
         convert pixel range from [0.0, 1.0] to [-1.0, 1.0] as requested by SigLIP.
         """
@@ -930,6 +953,10 @@ class VLAFlowMatching(nn.Module):
 
         # Cached scalar metrics for W&B logging (only updated in eager mode).
         self._last_tactile_vector_metrics: dict[str, float] | None = None
+
+        # Cached aux outputs from inference (best-effort; skipped under torch.compile).
+        self._last_next_tactile_pred: torch.Tensor | None = None
+        self._last_predicted_tactile_token_emb: torch.Tensor | None = None
         self.fake_image_token = self.vlm_with_expert.processor.tokenizer.fake_image_token_id
         self.global_image_token = self.vlm_with_expert.processor.tokenizer.global_image_token_id
         self.global_image_start_token = torch.tensor(
@@ -1472,11 +1499,22 @@ class VLAFlowMatching(nn.Module):
             tactile_images is not None and tactile_img_masks is not None
         )
         if has_any_tactile_input:
-            _, predicted_token_emb = self._predict_next_tactile_and_token_from_prefix(
+            next_tactile_pred, predicted_token_emb = self._predict_next_tactile_and_token_from_prefix(
                 prefix_embs=prefix_embs,
                 prefix_pad_masks=prefix_pad_masks,
                 prefix_att_masks=prefix_att_masks,
             )
+
+            # Best-effort caching for downstream logging/saving. Avoid side effects during torch.compile.
+            is_compiling = False
+            try:
+                is_compiling = bool(getattr(torch, "_dynamo", None) and torch._dynamo.is_compiling())
+            except Exception:
+                is_compiling = False
+            if not is_compiling:
+                self._last_next_tactile_pred = next_tactile_pred.detach()
+                self._last_predicted_tactile_token_emb = predicted_token_emb.detach()
+
             token_pad_mask = torch.ones(bsize, 1, dtype=torch.bool, device=device)
             token_att_mask = torch.ones(bsize, 1, dtype=torch.bool, device=device)
 
@@ -1486,6 +1524,16 @@ class VLAFlowMatching(nn.Module):
             prefix_embs = torch.cat([prefix_embs, predicted_token_emb], dim=1)
             prefix_pad_masks = torch.cat([prefix_pad_masks, token_pad_mask], dim=1)
             prefix_att_masks = torch.cat([prefix_att_masks, token_att_mask], dim=1)
+        else:
+            # Clear cached tactile outputs so downstream consumers don't read stale values.
+            is_compiling = False
+            try:
+                is_compiling = bool(getattr(torch, "_dynamo", None) and torch._dynamo.is_compiling())
+            except Exception:
+                is_compiling = False
+            if not is_compiling:
+                self._last_next_tactile_pred = None
+                self._last_predicted_tactile_token_emb = None
 
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1

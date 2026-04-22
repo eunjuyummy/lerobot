@@ -68,7 +68,7 @@ from lerobot.policies.smolvla.smolvlm_with_expert import SmolVLMWithExpertModel
 from lerobot.policies.utils import (
     populate_queues,
 )
-from lerobot.utils.constants import ACTION, OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS, OBS_STATE
+from lerobot.utils.constants import ACTION, OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS, OBS_STATE, OBS_TACTILES
 from lerobot.utils.utils import get_safe_dtype
 
 
@@ -222,6 +222,51 @@ def aloha_gripper_from_angular_inv(value):
     return normalize(value, min_val=0.4, max_val=1.5)
 
 
+class TactileImageEncoder(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        out_dim: int,
+        channels: tuple[int, int, int] = (32, 64, 128),
+        kernel_size: int = 3,
+        use_groupnorm: bool = True,
+    ):
+        super().__init__()
+        if kernel_size % 2 == 0:
+            raise ValueError(f"kernel_size must be odd to preserve centering. Got {kernel_size}")
+
+        def norm(num_channels: int) -> nn.Module:
+            if not use_groupnorm:
+                return nn.Identity()
+            # Use up to 8 groups, but must divide channels.
+            for groups in (8, 4, 2, 1):
+                if num_channels % groups == 0:
+                    return nn.GroupNorm(groups, num_channels)
+            return nn.GroupNorm(1, num_channels)
+
+        c1, c2, c3 = channels
+        pad = kernel_size // 2
+        self.net = nn.Sequential(
+            nn.Conv2d(in_channels, c1, kernel_size=kernel_size, stride=1, padding=pad, bias=not use_groupnorm),
+            norm(c1),
+            nn.SiLU(),
+            nn.Conv2d(c1, c2, kernel_size=kernel_size, stride=1, padding=pad, bias=not use_groupnorm),
+            norm(c2),
+            nn.SiLU(),
+            nn.Conv2d(c2, c3, kernel_size=kernel_size, stride=2, padding=pad, bias=not use_groupnorm),
+            norm(c3),
+            nn.SiLU(),
+            nn.AdaptiveAvgPool2d((1, 1)),
+            nn.Flatten(1),
+            nn.Linear(c3, out_dim),
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        if x.ndim != 4:
+            raise ValueError(f"Expected tactile image tensor (B,C,H,W). Got {tuple(x.shape)}")
+        return self.net(x)
+
+
 class SmolVLAPolicy(PreTrainedPolicy):
     """Wrapper class around VLAFlowMatching model to train and run inference within LeRobot."""
 
@@ -284,12 +329,21 @@ class SmolVLAPolicy(PreTrainedPolicy):
                 batch[k] = torch.stack(list(self._queues[k]), dim=1)
 
         images, img_masks = self.prepare_images(batch)
+        tactile_images, tactile_masks = self.prepare_tactiles(batch)
         state = self.prepare_state(batch)
         lang_tokens = batch[f"{OBS_LANGUAGE_TOKENS}"]
         lang_masks = batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
 
         actions = self.model.sample_actions(
-            images, img_masks, lang_tokens, lang_masks, state, noise=noise, **kwargs
+            images,
+            img_masks,
+            lang_tokens,
+            lang_masks,
+            tactile_images,
+            tactile_masks,
+            state,
+            noise=noise,
+            **kwargs,
         )
 
         # Unpad actions
@@ -371,13 +425,25 @@ class SmolVLAPolicy(PreTrainedPolicy):
             batch[ACTION] = self._pi_aloha_encode_actions_inv(batch[ACTION])
 
         images, img_masks = self.prepare_images(batch)
+        tactile_images, tactile_masks = self.prepare_tactiles(batch)
         state = self.prepare_state(batch)
         lang_tokens = batch[f"{OBS_LANGUAGE_TOKENS}"]
         lang_masks = batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
         actions = self.prepare_action(batch)
         actions_is_pad = batch.get("actions_id_pad")
         loss_dict = {}
-        losses = self.model.forward(images, img_masks, lang_tokens, lang_masks, state, actions, noise, time)
+        losses = self.model.forward(
+            images,
+            img_masks,
+            lang_tokens,
+            lang_masks,
+            tactile_images,
+            tactile_masks,
+            state,
+            actions,
+            noise,
+            time,
+        )
         loss_dict["losses_after_forward"] = losses.clone().mean().item()
 
         if actions_is_pad is not None:
@@ -404,15 +470,13 @@ class SmolVLAPolicy(PreTrainedPolicy):
         """Apply SmolVLA preprocessing to the images, like resizing to 224x224 and padding to keep aspect ratio, and
         convert pixel range from [0.0, 1.0] to [-1.0, 1.0] as requested by SigLIP.
         """
-        images = []
-        img_masks = []
-        present_img_keys = [key for key in self.config.image_features if key in batch]
-        missing_img_keys = [key for key in self.config.image_features if key not in batch]
-
-        if len(present_img_keys) == 0:
-            raise ValueError(
-                f"All image features are missing from the batch. At least one expected. (batch: {batch.keys()}) (image_features:{self.config.image_features})"
-            )
+        images: list[Tensor] = []
+        img_masks: list[Tensor] = []
+        # Only treat non-tactile visual inputs as camera images.
+        camera_keys = [key for key in self.config.image_features if not key.startswith(f"{OBS_TACTILES}.")]
+        present_img_keys = [key for key in camera_keys if key in batch]
+        missing_img_keys = [key for key in camera_keys if key not in batch]
+        
         # Preprocess image features present in the batch
         for key in present_img_keys:
             img = batch[key][:, -1, :, :, :] if batch[key].ndim == 5 else batch[key]
@@ -441,6 +505,85 @@ class SmolVLAPolicy(PreTrainedPolicy):
             images.append(img)
             img_masks.append(mask)
         return images, img_masks
+
+    def prepare_tactiles(self, batch: dict[str, Tensor]) -> tuple[list[Tensor], list[Tensor]]:
+        """Prepare tactile images as a list of tensors (B,C,H,W) plus per-key masks (B,).
+
+        Expected keys: `observation.tactiles.<name>`.
+        """
+
+        tactile_prefix = f"{OBS_TACTILES}."
+        # Batch may contain both tactile images and bookkeeping keys like `*_is_pad`.
+        # Only treat 4D/5D tensors as tactile images.
+        present_keys = []
+        for key in batch.keys():
+            if not key.startswith(tactile_prefix):
+                continue
+            if key.endswith("_padding_mask") or key.endswith("_is_pad"):
+                continue
+            value = batch[key]
+            if not isinstance(value, torch.Tensor):
+                continue
+            if value.ndim not in (4, 5):
+                continue
+            present_keys.append(key)
+        present_keys = sorted(present_keys)
+
+        tactile_images: list[Tensor] = []
+        tactile_masks: list[Tensor] = []
+        for key in present_keys:
+            img = batch[key][:, -1, ...] if batch[key].ndim == 5 else batch[key]
+
+            # Ensure channel-first
+            if img.ndim != 4:
+                raise ValueError(
+                    f"Tactile image must have shape (B,C,H,W) or (B,T,C,H,W). Got {tuple(batch[key].shape)} for {key}"
+                )
+
+            if img.shape[1] not in (1, 3) and img.shape[-1] in (1, 3):
+                img = img.permute(0, 3, 1, 2).contiguous()
+
+            # Convert to 3-channel format expected by the tactile CNN encoder.
+            if img.shape[1] == 1:
+                img = img.repeat(1, 3, 1, 1)
+            elif img.shape[1] > 3:
+                img = img[:, :3, :, :]
+            elif img.shape[1] != 3:
+                # Rare case (e.g., 2 channels): pad/truncate to 3.
+                if img.shape[1] < 3:
+                    pad = torch.zeros(
+                        (img.shape[0], 3 - img.shape[1], img.shape[2], img.shape[3]),
+                        dtype=img.dtype,
+                        device=img.device,
+                    )
+                    img = torch.cat([img, pad], dim=1)
+                else:
+                    img = img[:, :3, :, :]
+
+            # Normalize to [0,1] if it looks like [-1,1]
+            if img.dtype != torch.float32:
+                img = img.to(torch.float32)
+            if torch.isfinite(img).all() and img.min() < 0:
+                img = (img + 1.0) * 0.5
+            img = img.clamp(0.0, 1.0)
+
+            bsize = img.shape[0]
+            device = img.device
+            if f"{key}_padding_mask" in batch:
+                mask = batch[f"{key}_padding_mask"].bool()
+            elif f"{key}_is_pad" in batch:
+                # Some datasets expose pad as `*_is_pad` with shape (B,) or (B,1).
+                is_pad = batch[f"{key}_is_pad"]
+                if is_pad.ndim == 2 and is_pad.shape[1] == 1:
+                    is_pad = is_pad[:, 0]
+                mask = ~is_pad.to(device=device).bool()
+            else:
+                mask = torch.ones(bsize, dtype=torch.bool, device=device)
+
+            tactile_images.append(img)
+            tactile_masks.append(mask)
+
+        return tactile_images, tactile_masks
 
     def _pi_aloha_decode_state(self, state):
         # Flip the joints.
@@ -571,6 +714,17 @@ class VLAFlowMatching(nn.Module):
         self.state_proj = nn.Linear(
             self.config.max_state_dim, self.vlm_with_expert.config.text_config.hidden_size
         )
+
+        # Tactile image encoder (CNN -> flatten -> token embedding).
+        # No explicit config/flag is required: if `tactile_images` is provided at runtime,
+        # we encode it; otherwise this path is a no-op.
+        self.tactile_encoder: nn.Module | None = TactileImageEncoder(
+            in_channels=3,
+            out_dim=self.vlm_with_expert.config.text_config.hidden_size,
+            channels=(32, 64, 128),
+            kernel_size=3,
+            use_groupnorm=True,
+        )
         self.action_in_proj = nn.Linear(self.config.max_action_dim, self.vlm_with_expert.expert_hidden_size)
         self.action_out_proj = nn.Linear(self.vlm_with_expert.expert_hidden_size, self.config.max_action_dim)
 
@@ -623,7 +777,14 @@ class VLAFlowMatching(nn.Module):
         return time
 
     def embed_prefix(
-        self, images, img_masks, lang_tokens, lang_masks, state: torch.Tensor = None
+        self,
+        images,
+        img_masks,
+        lang_tokens,
+        lang_masks,
+        tactile_images,
+        tactile_masks,
+        state: torch.Tensor = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Embed images with SigLIP and language tokens with embedding layer to prepare
         for SmolVLM transformer processing.
@@ -689,6 +850,14 @@ class VLAFlowMatching(nn.Module):
         num_lang_embs = lang_emb.shape[1]
         att_masks += [0] * num_lang_embs
 
+        tactile_token_emb, tactile_token_mask = self._encode_tactile_token(tactile_images, tactile_masks)
+        if tactile_token_emb is not None and tactile_token_mask is not None:
+            tactile_token_emb = tactile_token_emb[:, None, :]
+            embs.append(tactile_token_emb)
+            pad_masks.append(tactile_token_mask[:, None])
+            # Similar to state: image+language shouldn't attend to tactile.
+            att_masks += [1]
+
         state_emb = self.state_proj(state)
         state_emb = state_emb[:, None, :] if state_emb.ndim == 2 else state_emb
         embs.append(state_emb)
@@ -715,6 +884,44 @@ class VLAFlowMatching(nn.Module):
         att_masks = att_masks.expand(bsize, -1)
 
         return embs, pad_masks, att_masks
+
+    def _encode_tactile_token(
+        self, tactile_images: list[Tensor], tactile_masks: list[Tensor]
+    ) -> tuple[Tensor | None, Tensor | None]:
+        if self.tactile_encoder is None:
+            return None, None
+        if len(tactile_images) == 0:
+            return None, None
+
+        if len(tactile_images) != len(tactile_masks):
+            raise ValueError(
+                f"tactile_images and tactile_masks must have same length. Got {len(tactile_images)} and {len(tactile_masks)}"
+            )
+
+        embs = []
+        masks = []
+        for img, mask in zip(tactile_images, tactile_masks, strict=False):
+            if img.ndim != 4:
+                raise ValueError(f"tactile image must be (B,C,H,W). Got {tuple(img.shape)}")
+            if mask.ndim != 1:
+                raise ValueError(f"tactile mask must be (B,). Got {tuple(mask.shape)}")
+            embs.append(self.tactile_encoder(img))
+            masks.append(mask)
+
+        tactile_embs = torch.stack(embs, dim=1)  # (B, N, D)
+        tactile_key_masks = torch.stack(masks, dim=1)  # (B, N)
+
+        weights = tactile_key_masks.to(dtype=tactile_embs.dtype)
+        denom = weights.sum(dim=1)  # (B,)
+        any_present = denom > 0
+        denom_safe = denom.clamp(min=1.0)
+        pooled = (tactile_embs * weights[:, :, None]).sum(dim=1) / denom_safe[:, None]
+
+        # If a sample has no tactile, keep token masked out.
+        if not any_present.all():
+            pooled = pooled * any_present[:, None].to(dtype=pooled.dtype)
+
+        return pooled, any_present
 
     def embed_suffix(self, noisy_actions, timestep):
         """Embed state, noisy_actions, timestep to prepare for Expert Gemma processing."""
@@ -760,7 +967,17 @@ class VLAFlowMatching(nn.Module):
         return embs, pad_masks, att_masks
 
     def forward(
-        self, images, img_masks, lang_tokens, lang_masks, state, actions, noise=None, time=None
+        self,
+        images,
+        img_masks,
+        lang_tokens,
+        lang_masks,
+        tactile_images,
+        tactile_masks,
+        state,
+        actions,
+        noise=None,
+        time=None,
     ) -> Tensor:
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
         if noise is None:
@@ -773,7 +990,13 @@ class VLAFlowMatching(nn.Module):
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks, state=state
+            images,
+            img_masks,
+            lang_tokens,
+            lang_masks,
+            tactile_images,
+            tactile_masks,
+            state=state,
         )
         suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, time)
 
@@ -803,6 +1026,8 @@ class VLAFlowMatching(nn.Module):
         img_masks,
         lang_tokens,
         lang_masks,
+        tactile_images,
+        tactile_masks,
         state,
         noise=None,
         **kwargs: Unpack[ActionSelectKwargs],
@@ -816,7 +1041,13 @@ class VLAFlowMatching(nn.Module):
             noise = self.sample_noise(actions_shape, device)
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks, state=state
+            images,
+            img_masks,
+            lang_tokens,
+            lang_masks,
+            tactile_images,
+            tactile_masks,
+            state=state,
         )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
